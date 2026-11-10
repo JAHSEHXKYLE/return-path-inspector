@@ -1,0 +1,57 @@
+name: Test and build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run regression tests
+        run: node --test test/popup.test.cjs test/return-path.test.cjs
+      - name: Build and verify extension package
+        run: |
+          python build.py
+          $package = Get-ChildItem build/dist -Filter '*.eext' | Select-Object -First 1
+          python -m zipfile -t $package.FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easyeda-extension
+          path: build/dist/*.eext
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: easyeda-extension
+          path: release
+      - name: Publish the verified extension package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $package = Get-Item -LiteralPath "release/return-path-inspector_$env:RELEASE_TAG.eext"
+          gh release create $env:RELEASE_TAG $package.FullName --verify-tag --title $env:RELEASE_TAG --generate-notes

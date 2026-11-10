@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回流路径检查 v{{VERSION}}</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font: 13px/1.45 "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    color: #ffffff;
+    background: #353535;
+    --bar: #404040;
+    --field: #4e4e4e;
+    --border: #222222;
+    --row-border: #484848;
+    --selected: #434950;
+    --accent: #1890ff;
+    --action: #006fc9;
+    --focus: #73b9ff;
+    --canvas: #000000;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; overflow: clip; }
+  body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; margin: 0; }
+  button, select, summary, input[type=number] { color: inherit; font: inherit; }
+  button, select, input[type=number] { background: var(--field); border: 1px solid var(--border); border-radius: 2px; padding: 4px 8px; }
+  select { min-width: 0; max-width: 100%; }
+  input[type=radio], progress { accent-color: var(--accent); }
+  button:not(:disabled) { cursor: pointer; }
+  button:disabled { background: #2e2e2e; color: #bdbdbd; cursor: default; }
+  button:hover:not(:disabled), summary:hover { border-color: var(--accent); }
+  :is(button, select, summary, input):focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
+  .primary { background: var(--action); border-color: var(--accent); }
+  header { background: var(--bar); border-bottom: 1px solid var(--border); padding: 8px 12px; }
+  .heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px 12px; }
+  h1 { margin: 0; font-size: 15px; }
+  p { margin: 4px 0 0; }
+  .muted, small { font-size: 12px; }
+  #notice:not(:empty) { border-left: 2px solid var(--accent); padding-left: 6px; max-height: min(52px, 9vh); overflow: auto; }
+  #calculationProgress { margin-top: 6px; }
+  #calculationProgress small { color: #bdbdbd; margin-left: 8px; }
+  #calculationProgress progress { display: block; width: 100%; height: 8px; margin-top: 4px; }
+  .controls { padding: 0 12px 8px; border-bottom: 1px solid var(--border); }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0; }
+  .command-bar { margin: 0 -12px 6px; padding: 5px 12px; background: var(--bar); border-bottom: 1px solid var(--border); }
+  .pairs { display: grid; max-height: min(84px, 13vh); overflow: auto; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; padding: 3px 5px; border-bottom: 1px solid var(--row-border); }
+  .pair span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  main { display: grid; grid-template-columns: minmax(220px, 29%) minmax(0, 1fr); min-height: 0; }
+  aside { display: grid; grid-template-rows: auto minmax(0, 1fr) fit-content(42%); min-width: 0; min-height: 0; overflow: hidden; border-right: 1px solid var(--border); }
+  .panel-bar { min-height: 32px; margin: 0; padding: 4px 9px; background: var(--bar); border-bottom: 1px solid var(--border); }
+  .route-list { display: grid; align-content: start; min-height: 0; overflow: auto; }
+  .route { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; text-align: left; border: 0; border-bottom: 1px solid var(--row-border); border-left: 3px solid transparent; border-radius: 0; background: transparent; }
+  .route:hover:not(:disabled) { background: var(--bar); border-bottom-color: var(--row-border); border-left-color: var(--focus); }
+  .route span { font-variant-numeric: tabular-nums; }
+  .route small { grid-column: 1 / -1; }
+  .route[aria-pressed=true], .route[aria-pressed=true]:hover { background: var(--selected); border-left-color: var(--accent); }
+  .route:first-child:not([aria-pressed=true]) { border-left-color: var(--focus); }
+  #detail {
+    margin: 7px 8px;
+    padding: 7px 8px;
+    background: #262626;
+    border: 1px solid var(--border);
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    min-height: 0;
+    max-height: 132px;
+    overflow: auto;
+  }
+  .preview { display: grid; grid-template-rows: auto minmax(0, 1fr) fit-content(35%); min-width: 0; min-height: 0; overflow: hidden; }
+  .config { position: relative; margin-bottom: 5px; border: 1px solid var(--border); }
+  summary { padding: 4px 8px; background: var(--bar); border: 1px solid transparent; cursor: pointer; font-weight: 600; }
+  .config-grid {
+    position: absolute;
+    z-index: 1;
+    inset: 100% 0 auto;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+    padding: 6px;
+    max-height: min(380px, 58vh, calc(100vh - 155px));
+    overflow: auto;
+    background: #353535;
+    border: 1px solid var(--border);
+    box-shadow: 0 5px 10px #0008;
+  }
+  .config-group { min-width: 0; margin: 0; padding: 4px 7px 6px; border: 1px solid var(--row-border); }
+  .config-group legend { padding: 0 4px; font-weight: 600; }
+  .preview-title { display: flex; align-items: center; font-size: 13px; }
+  .styles label { display: inline-flex; align-items: center; gap: 5px; }
+  .styles input[type=number] { width: 74px; padding: 4px; }
+  .styles input[type=color] { width: 36px; height: 28px; padding: 2px; }
+  svg { display: block; width: 100%; height: 100%; min-height: 0; background: var(--canvas) radial-gradient(#232323 0.6px, transparent 0.6px) 0 0 / 6px 6px; }
+  .preview-status { min-height: 0; max-height: 68px; overflow: auto; padding: 4px 9px 7px; background: var(--bar); border-top: 1px solid var(--border); }
+  .legend { display: flex; flex-wrap: wrap; gap: 3px 10px; font-size: 12px; }
+  .legend i { width: 10px; height: 10px; display: inline-block; border: 1px solid #ffffff; margin-right: 5px; }
+  .warnings { font-size: 12px; padding: 4px 12px 8px; border-top: 1px solid var(--border); max-height: min(70px, 12vh); overflow: auto; }
+  .warnings:empty { display: none; }
+  .warnings p { border-left: 3px solid #e9b76c; padding-left: 7px; }
+  @media (max-width: 620px) {
+    main, .config-grid { grid-template-columns: 1fr; }
+    main { grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+    aside { border-right: 0; border-bottom: 1px solid var(--border); }
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="heading">
+    <h1>回流路径检查 v{{VERSION}}</h1>
+    <span class="muted">同网铜箔几何长度 · mm · 圆圈表示换层</span>
+  </div>
+  <p id="notice" role="status">正在连接 PCB 编辑器…</p>
+  <div id="calculationProgress" hidden>
+    <label id="progressStage" for="progressBar" role="status"></label>
+    <small>Esc 取消</small>
+    <progress id="progressBar"></progress>
+  </div>
+</header>
+<section class="controls" aria-label="端点和计算设置">
+  <div class="toolbar command-bar">
+    <button id="pick" disabled>采集下一对点</button>
+    <button id="calculate" class="primary" disabled>计算 / 重新计算</button>
+    <button id="clear" disabled>清除已生成路径</button>
+    <button id="close" disabled>关闭预览</button>
+  </div>
+  <details id="configuration" class="config" hidden>
+    <summary>配置</summary>
+    <div class="config-grid">
+      <fieldset class="config-group">
+        <legend>计算方式</legend>
+        <div class="toolbar">
+          <label><input type="radio" name="mode" value="separate" checked> 分开计算</label>
+          <label><input type="radio" name="mode" value="joint"> 共同计算</label>
+        </div>
+      </fieldset>
+      <fieldset class="config-group">
+        <legend>图层显示</legend>
+        <div class="toolbar">
+          <label>范围 <select id="display" disabled>
+            <option value="follow">跟随画布</option>
+            <option value="current">仅当前铜层</option>
+            <option value="all">全部铜层</option>
+          </select></label>
+          <label id="manualLabel" hidden>指定铜层 <select id="manualLayer"></select></label>
+        </div>
+        <small>在此窗口按 Shift+S 切换仅当前铜层。</small>
+      </fieldset>
+      <fieldset class="config-group" id="styleSettings" hidden>
+        <legend id="styleTitle">路径样式</legend>
+        <div class="toolbar">
+          <label>配色 <select id="color" disabled>
+            <option value="layer">按铜层配色</option>
+            <option value="custom">逐层自定义</option>
+            <option value="mono">统一颜色</option>
+          </select></label>
+          <label>曲线线段密度 <select id="curveDensity">
+            <option value="1">1× 简略</option>
+            <option value="2" selected>2× 标准</option>
+            <option value="3">3× 精细</option>
+            <option value="4">4× 更精细</option>
+          </select></label>
+        </div>
+        <div class="toolbar styles">
+          <label>铜层 <select id="styleLayer"></select></label>
+          <label>颜色 <input type="color" id="styleColor"></label>
+          <label>基础线宽 <input type="number" id="styleWidth" min="0.2" max="8" step="0.1"> mil</label>
+          <button id="styleReset" type="button">重置此层</button>
+        </div>
+        <div class="toolbar styles">
+          <label>工作区线宽 <input type="number" id="workspaceWidth" min="0.2" max="50" step="0.1" value="8"> mil</label>
+        </div>
+        <small>工作区线宽单独设置。圆角密度即时更新，原生圆弧采样在重新计算后更新。</small>
+      </fieldset>
+      <fieldset class="config-group">
+        <legend>过孔与换层长度</legend>
+        <p id="stackupSource" class="muted"></p>
+        <div class="toolbar styles">
+          <label>备用板厚 <input id="boardThickness" type="number" min="0" step="any" value="1.6"> mm</label>
+          <button id="useThickness" type="button">按板厚估算</button>
+        </div>
+        <p id="layerGaps" class="muted"></p>
+        <p class="muted">换层长度为进出铜层中心的垂直距离。可在无法读取物理叠层时手动填写各层深度。</p>
+        <div class="toolbar styles" id="stackupDepths"></div>
+        <div class="toolbar">
+          <button id="stackupApply" type="button">保存手动深度</button>
+          <button id="stackupReset" type="button">恢复自动</button>
+        </div>
+      </fieldset>
+    </div>
+  </details>
+  <div class="pairs" id="pairs" aria-label="起始点和流入点配对"></div>
+</section>
+<main>
+  <aside aria-label="按长度排序的路径">
+    <div class="toolbar panel-bar">
+      <strong id="resultTitle">路径列表</strong>
+      <select id="group" aria-label="选择端点对" hidden></select>
+    </div>
+    <div id="routes" class="route-list"></div>
+    <div id="detail" aria-live="polite"></div>
+  </aside>
+  <section class="preview" aria-label="路径示意图">
+    <h2 class="panel-bar preview-title">路径示意图</h2>
+    <svg id="drawing" role="img" aria-label="当前显示的铜箔路径" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="preview-status">
+      <div id="legend" class="legend"></div>
+      <p id="viewNote" class="muted"></p>
+    </div>
+  </section>
+</main>
+<div class="warnings" id="warnings"></div>
+<script src="./results.js"></script>
+</body>
+</html>

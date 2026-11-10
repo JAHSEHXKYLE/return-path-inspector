@@ -1,0 +1,25 @@
+{
+  "name": "return-path-inspector",
+  "uuid": "bc241778ebad4c8fb9139182d3bddb19",
+  "displayName": "回流路径检查",
+  "description": "在 PCB 中检查同网络、同板框的几何回流候选路径，并按长度排序。",
+  "version": "0.1.20",
+  "engines": { "eda": "^4.1.0" },
+  "entry": "./dist/index",
+  "categories": ["PCB", "Other"],
+  "headerMenus": {
+    "pcb": [
+      {
+        "id": "returnPath",
+        "title": "回流路径",
+        "menuItems": [
+          { "id": "quick", "title": "单对点检查", "registerFn": "checkReturnPath" },
+          { "id": "multi", "title": "多对点检查", "registerFn": "checkMultiplePaths" },
+          { "id": "log", "title": "查看运行日志", "registerFn": "showRunLog" },
+          { "id": "clear", "title": "清除已生成路径", "registerFn": "clearReturnPaths" },
+          { "id": "cancel", "title": "取消选点", "registerFn": "cancelPicking" }
+        ]
+      }
+    ]
+  }
+}

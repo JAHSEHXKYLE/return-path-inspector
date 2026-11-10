@@ -1,0 +1,12 @@
+build/
+dist/
+node_modules/
+__pycache__/
+*.py[cod]
+*.eext
+*.zip
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
