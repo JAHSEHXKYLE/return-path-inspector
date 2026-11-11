@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,6 +65,16 @@ class PackageTests(unittest.TestCase):
                         target.writestr(name, source.read(name))
             with self.assertRaises(KeyError):
                 build.verify_package(damaged)
+
+    def test_verification_cli_works_with_windows_legacy_encoding(self):
+        with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:
+            package = build.build(Path(directory))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "build.py"), "--verify", str(package)],
+                env=dict(os.environ, PYTHONIOENCODING="cp1252"), capture_output=True, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("cp1252"))
+            self.assertIn(b"Verified return-path-inspector", result.stdout)
 
 
 if __name__ == "__main__":

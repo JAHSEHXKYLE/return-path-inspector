@@ -92,6 +92,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.verify:
         manifest = verify_package(args.verify)
-        print(f"已验证 {manifest['name']} v{manifest['version']}")
+        print(f"Verified {manifest['name']} v{manifest['version']}")
     else:
         print(build(args.output))
