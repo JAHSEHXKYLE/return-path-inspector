@@ -3,10 +3,13 @@
   "uuid": "bc241778ebad4c8fb9139182d3bddb19",
   "displayName": "回流路径检查",
   "description": "在同网络、同板框的铜箔中搜索不同的可行路线，并合并相似解。",
-  "version": "0.1.34",
+  "version": "0.1.35",
   "engines": { "eda": "^4.1.0" },
   "entry": "./dist/index",
   "categories": ["PCB", "Other"],
+  "images": {
+    "logo": "./images/logo.png"
+  },
   "headerMenus": {
     "pcb": [
       {

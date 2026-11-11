@@ -43,6 +43,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: easyeda-extension
@@ -54,4 +57,10 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $package = Get-Item -LiteralPath "release/return-path-inspector_$env:RELEASE_TAG.eext"
-          gh release create $env:RELEASE_TAG $package.FullName --verify-tag --title $env:RELEASE_TAG --generate-notes
+          $changelog = Get-Content -LiteralPath CHANGELOG.md -Raw -Encoding utf8
+          $pattern = '(?ms)^## ' + [regex]::Escape($env:RELEASE_TAG) + '\r?\n(.*?)(?=^## |\z)'
+          $entry = [regex]::Match($changelog, $pattern)
+          if (-not $entry.Success) { throw "更新日志中找不到版本 $env:RELEASE_TAG" }
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [System.IO.File]::WriteAllText($notes, $entry.Groups[1].Value.Trim(), [System.Text.UTF8Encoding]::new($false))
+          gh release create $env:RELEASE_TAG $package.FullName --verify-tag --title "回流路径检查 $env:RELEASE_TAG" --notes-file $notes

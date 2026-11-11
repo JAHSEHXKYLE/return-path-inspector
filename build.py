@@ -24,10 +24,13 @@ def bundle(version):
 def build(output_dir):
     manifest = json.loads((BASE / "extension.json").read_text(encoding="utf-8-sig"))
     version = manifest["version"]
+    logo_path = Path(manifest["images"]["logo"])
+    logo = (BASE / logo_path).read_bytes()
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / f"{manifest['name']}_v{version}.eext"
     with ZipFile(archive_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
         archive.writestr("extension.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        archive.writestr(logo_path.as_posix(), logo)
         archive.writestr("dist/", b"")
         archive.writestr("dist/index.js", bundle(version))
         archive.writestr("iframe/", b"")

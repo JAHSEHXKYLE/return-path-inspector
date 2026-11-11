@@ -1,8 +1,10 @@
 # 回流路径检查 · Return Path Inspector
 
+<img src="images/logo.png" width="112" height="112" alt="回流路径检查 Logo">
+
 嘉立创 EDA 专业版 PCB 扩展。选择起始点和流入点，查看同一网络铜箔中的不同可行路线、换层位置和几何长度。
 
-**当前版本 v0.1.34** · Windows · 嘉立创 EDA 专业版 V4.1
+**当前版本 v0.1.35** · Windows · 嘉立创 EDA 专业版 V4.1
 
 [下载扩展](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) · [版本记录](CHANGELOG.md) · [详细判定范围](docs/guide.md#判定与范围)
 
@@ -10,8 +12,8 @@
 
 ## 安装与第一次检查
 
-1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v0.1.34.eext`。
-2. 在嘉立创 EDA 中打开目标 PCB，通过 **高级 → 扩展管理器 → 导入** 选择扩展包，并在已安装列表中启用。
+1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v0.1.35.eext`。
+2. 在嘉立创 EDA 中打开目标 PCB，通过 **高级 → 扩展管理器 → 导入** 选择扩展包，并在已安装列表中启用。扩展包内置项目 PNG Logo，已安装列表会使用该图标。
 3. 确认 PCB 已生成最新覆铜。打开 **回流路径 → 单对点检查**，按顶部提示先点击起始点，再点击流入点。部分客户端将扩展入口放在「高级」菜单下。
 4. 两点采集完成后自动计算，列表按长度排列不同的可行解。默认选中第一条，工作区同步显示这条路线。
 
@@ -132,7 +134,7 @@ node --test test/popup.test.cjs test/return-path.test.cjs
 python build.py
 ```
 
-构建结果位于 `build/dist/return-path-inspector_v0.1.34.eext`。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包会发布到 Releases。
+构建结果位于 `build/dist/return-path-inspector_v0.1.35.eext`。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包会发布到 Releases，发布说明使用对应版本的中文更新记录。
 
 | 路径 | 内容 |
 | --- | --- |
@@ -140,6 +142,7 @@ python build.py
 | `src/pcb.js` | EDA 图元读取、板框与叠层适配 |
 | `src/index.js` | 扩展入口、交互状态与工作区预览 |
 | `iframe/` | 结果窗口、内置教程与选点提示 |
+| `images/` | 扩展管理器 PNG 图标与 SVG 原稿 |
 | `test/` | 求解器、界面及 EDA 接口模拟测试 |
 | `docs/images/` | 本说明书使用的操作截图 |
 | `docs/guide.md` | 详细使用指南与判定范围 |
