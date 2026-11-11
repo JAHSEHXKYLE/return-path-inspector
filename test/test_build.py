@@ -24,6 +24,9 @@ class PackageTests(unittest.TestCase):
             manifest = build.verify_package(package)
             with ZipFile(package) as archive:
                 self.assertEqual(archive.read("images/logo.png"), (ROOT / "images/logo.png").read_bytes())
+                for name in ("images/banner.jpg", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE",
+                             "docs/guide.md", "docs/images/01-route-overview.png"):
+                    self.assertEqual(archive.read(name), (ROOT / name).read_bytes())
                 self.assertEqual(manifest, json.loads((ROOT / "extension.json").read_text(encoding="utf-8-sig")))
                 code = archive.read("dist/index.js").decode()
                 for function in build.EXPORTS:
@@ -43,9 +46,10 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:
             workspace = Path(directory) / "source"
             workspace.mkdir()
-            for name in ("src", "iframe", "images"):
+            for name in ("src", "iframe", "images", "docs"):
                 shutil.copytree(ROOT / name, workspace / name)
-            shutil.copyfile(ROOT / "extension.json", workspace / "extension.json")
+            for name in ("extension.json", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"):
+                shutil.copyfile(ROOT / name, workspace / name)
             with patch.object(build, "BASE", workspace):
                 package = build.build(Path(directory) / "output")
                 previous = package.read_bytes()
@@ -55,16 +59,37 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(previous, package.read_bytes())
                 self.assertEqual(list(package.parent.glob("*.tmp")), [])
 
-    def test_verifier_rejects_missing_icon(self):
+    def test_verifier_rejects_missing_marketplace_resources(self):
         with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:
             package = build.build(Path(directory))
             damaged = Path(directory) / "damaged.eext"
-            with ZipFile(package) as source, ZipFile(damaged, "w") as target:
-                for name in source.namelist():
-                    if name != "images/logo.png":
-                        target.writestr(name, source.read(name))
-            with self.assertRaises(KeyError):
-                build.verify_package(damaged)
+            for missing in ("images/logo.png", "images/banner.jpg", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"):
+                with self.subTest(missing=missing):
+                    with ZipFile(package) as source, ZipFile(damaged, "w") as target:
+                        for name in source.namelist():
+                            if name != missing:
+                                target.writestr(name, source.read(name))
+                    with self.assertRaises(KeyError):
+                        build.verify_package(damaged)
+
+    def test_verifier_rejects_missing_license_metadata_and_stale_changelog(self):
+        with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:
+            package = build.build(Path(directory))
+            damaged = Path(directory) / "damaged.eext"
+            for mutation in ("license", "changelog"):
+                with self.subTest(mutation=mutation):
+                    with ZipFile(package) as source, ZipFile(damaged, "w") as target:
+                        for name in source.namelist():
+                            data = source.read(name)
+                            if mutation == "license" and name == "extension.json":
+                                manifest = json.loads(data)
+                                manifest.pop("license")
+                                data = json.dumps(manifest).encode()
+                            if mutation == "changelog" and name == "CHANGELOG.md":
+                                data = b"# Changelog\n\n## v0.0.0\nOld entry\n"
+                            target.writestr(name, data)
+                    with self.assertRaises(ValueError):
+                        build.verify_package(damaged)
 
     def test_verification_cli_works_with_windows_legacy_encoding(self):
         with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:

@@ -3,8 +3,9 @@
   "uuid": "bc241778ebad4c8fb9139182d3bddb19",
   "displayName": "回流路径检查",
   "description": "在同网络、同板框的铜箔中搜索不同的可行路线，并合并相似解。",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "JAHSEHKYLE",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "repository": {
     "type": "github",
     "url": "https://github.com/JAHSEHXKYLE/return-path-inspector"
@@ -15,7 +16,8 @@
   "entry": "./dist/index",
   "categories": ["PCB", "Other"],
   "images": {
-    "logo": "./images/logo.png"
+    "logo": "./images/logo.png",
+    "banner": "./images/banner.jpg"
   },
   "headerMenus": {
     "pcb": [
