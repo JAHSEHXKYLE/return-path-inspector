@@ -4,20 +4,29 @@
 
 嘉立创 EDA 专业版 PCB 扩展。选择起始点和流入点，查看同一网络铜箔中的不同可行路线、换层位置和几何长度。
 
-**当前版本 v0.1.35** · Windows · 嘉立创 EDA 专业版 V4.1
+**当前版本 v1.0.0 正式版** · Windows · 嘉立创 EDA 专业版 V4.1
 
-[下载扩展](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) · [版本记录](CHANGELOG.md) · [详细判定范围](docs/guide.md#判定与范围)
+[下载扩展](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) · [版本记录](CHANGELOG.md) · [1.0 发布与验证记录](docs/release-1.0.md) · [详细判定范围](docs/guide.md#判定与范围)
 
-本页为图文使用说明书。截图使用 v0.1.34 的实际界面与示例路线数据，在独立浏览器中渲染，展示结果窗口的内容区。
+本页为图文使用说明书。截图使用 v1.0.0 的实际界面与示例路线数据，在独立浏览器中渲染，展示结果窗口的内容区。
 
 ## 安装与第一次检查
 
-1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v0.1.35.eext`。
+1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v1.0.0.eext`。
 2. 在嘉立创 EDA 中打开目标 PCB，通过 **高级 → 扩展管理器 → 导入** 选择扩展包，并在已安装列表中启用。扩展包内置项目 PNG Logo，已安装列表会使用该图标。
 3. 确认 PCB 已生成最新覆铜。打开 **回流路径 → 单对点检查**，按顶部提示先点击起始点，再点击流入点。部分客户端将扩展入口放在「高级」菜单下。
 4. 两点采集完成后自动计算，列表按长度排列不同的可行解。默认选中第一条，工作区同步显示这条路线。
 
 两端可选择有网络的铜层焊盘、金属化多层焊盘、普通过孔或走线。起始点与流入点须属于相同的非空网络，并处于同一个闭合板框内。放大后点击焊盘中心，可减少铺铜或器件遮挡造成的误选。
+
+### 从测试版升级
+
+1. 在扩展管理器中导入 v1.0.0 包，按客户端提示更新同名扩展。
+2. 检查已安装版本及项目图标，重新打开一次「回流路径」窗口。
+3. 当前 PCB 的颜色、线宽、板厚和铜层深度沿用原配置。需要更新路线结果时，点击「计算 / 重新计算」。
+4. 测试版登记的预览线可通过「清除已生成路径」清理。备份文件、工程权限及 PCB 的保存操作按项目原有流程处理。
+
+Releases 同时提供安装包的 SHA-256 文件。Windows PowerShell 中可用 `Get-FileHash .\return-path-inspector_v1.0.0.eext -Algorithm SHA256` 核对下载内容。
 
 ## 查看路线
 
@@ -117,7 +126,7 @@
 
 ## 结果含义与计算范围
 
-求解会尝试起点的其他出发方向、沿途岔口、从流入点反向搜索，以及两端共有铜层上的全程同层路线。反向结果统一回原顺序，相似走法保留较短的代表。符合几何条件的近邻过孔会合并，减少重复换层分支。
+求解会尝试起点的其他出发方向、沿途岔口、从流入点反向搜索，以及两端共有铜层上的全程同层路线。一个焊盘与同一覆铜区的不同接触位置会分别接入求解图。反向结果统一回原顺序，相似走法保留较短的代表。符合几何条件的近邻过孔会合并，减少重复换层分支。
 
 长度由可读取的铜箔几何和换层距离计算。搜索使用连接图、时间和状态预算，达到预算或铜箔读取受限时，界面会报告相应提示。复杂铜区的最短结果属于搜索得到的候选近似值，实际电流分布、回流阻抗和高频耦合需要电气模型。
 
@@ -131,10 +140,12 @@
 git clone https://github.com/JAHSEHXKYLE/return-path-inspector.git
 cd return-path-inspector
 node --test test/popup.test.cjs test/return-path.test.cjs
+python -m unittest discover -s test -p "test_*.py" -v
 python build.py
+python build.py --verify build/dist/return-path-inspector_v1.0.0.eext
 ```
 
-构建结果位于 `build/dist/return-path-inspector_v0.1.35.eext`。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包会发布到 Releases，发布说明使用对应版本的中文更新记录。
+构建结果位于 `build/dist/return-path-inspector_v1.0.0.eext`，同目录生成 `.eext.sha256`。相同源码和构建环境的重复构建会生成相同安装包。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包及校验文件会发布到 Releases，发布说明使用对应版本的中文更新记录。
 
 | 路径 | 内容 |
 | --- | --- |

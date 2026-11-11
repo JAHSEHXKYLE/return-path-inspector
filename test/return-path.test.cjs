@@ -534,6 +534,27 @@ test('complex poured copper can connect nearby terminals without using shortcuts
   assert.equal(result.incomplete,false);
 });
 
+test('retains separate pad contacts to one copper region in both search directions', () => {
+  const rotate=([x,y])=>p((x+y)*Math.SQRT1_2,(y-x)*Math.SQRT1_2);
+  const ring=[[-35,-3],[-6,-3],[-6,3],[-29,3],[-29,33],[29,33],
+    [29,3],[8,3],[8,-3],[35,-3],[35,39],[-35,39]].map(rotate);
+  const outline=api.sealBoard([rect(-100,-100,200,200)]);
+  const end={...e('end',0,0,[2]),p:rotate([0,36])};
+  const circular={...e('pad',0,0,[2]),radius:10};
+  const rectangular={...circular,outline:rect(-10,-10,20,20).slice(0,-1).map(v=>rotate([v.x,v.y]))};
+  for (const pad of [circular,rectangular]) {
+    const model=m([],[pad,end],[{id:'copper',layer:2,rings:[ring]}]);
+    for (const [start,finish] of [[pad,end],[end,pad]]) {
+      const result=api.computeRoutes(model,start,finish,outline);
+      assert.equal(result.routes.length,2);
+      const contacts=result.routes.map(route=>route.edges.find(edge=>edge.kind==='pad').path);
+      assert.ok(contacts.some(path=>path.some(v=>v.x<0&&v.y>0)));
+      assert.ok(contacts.some(path=>path.some(v=>v.x>0&&v.y<0)));
+      assert.equal(result.incomplete,false);
+    }
+  }
+});
+
 test('large copper with many contacts finds a remote detour within the closed board', () => {
   const outer = Array.from({length: 3200}, (_, i) => {
     const angle = i * Math.PI / 1600;
@@ -723,6 +744,22 @@ test('detects only enabled copper layers and restores independently saved colors
   assert.equal(session.curveDensity,4);
   assert.equal(session.workspaceWidth,12);
   assert.deepEqual(plain(session.layerStyles),{1:{color:'#FF00FF',width:0.4},15:{color:'#08FF22',width:1.1}});
+});
+
+test('restores pre-1.0 style settings that omit newer configuration fields', async () => {
+  const doc={uuid:'legacy-board',parentProjectUuid:'legacy-project'};
+  const session={doc,layers:[{id:1},{id:2}],colorMode:'layer',layerStyles:{},
+    curveDensity:2,workspaceWidth:8,boardThicknessMm:1.6};
+  context.eda={sys_Storage:{getExtensionUserConfig:key=>{
+    assert.equal(key,'style:preview:legacy-project:legacy-board');
+    return JSON.stringify({mode:'custom',layers:{1:{color:'ff00ff',width:1.2}}});
+  }}};
+  await api.readStyles(session);
+  assert.deepEqual(plain(session.layerStyles),{1:{color:'#FF00FF',width:1.2}});
+  assert.equal(session.colorMode,'custom');
+  assert.equal(session.workspaceWidth,8);
+  assert.equal(session.curveDensity,2);
+  assert.equal(session.boardThicknessMm,1.6);
 });
 
 test('supports native Hide layer state even when the current layer API is a stub', async () => {

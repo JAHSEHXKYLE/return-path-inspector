@@ -1334,22 +1334,33 @@ function trackCopperContact(segment, edges, reach) {
   return best;
 }
 
-function copperContact(anchor, edges, stroke = 0) {
+function copperContacts(anchor, edges, stroke = 0) {
   const outline = anchor.outline ? ringEdges(anchor.outline) : null;
-  if (!outline && !(anchor.radius > SNAP)) return undefined;
+  if (!outline && !(anchor.radius > SNAP)) return [];
   const fringe = stroke / 2;
   const reach = (outline ? Math.max(...anchor.outline.map(p => distance(anchor.p, p))) : anchor.radius) + fringe;
-  let nearest, gap = Infinity;
-  const consider = (p, entry = p) => {
-    const d = distance(anchor.p, entry) + distance(entry, p);
-    if (d >= gap) return;
-    if (outline ? !inCopper(entry, outline) : d > reach + EPS) return;
-    nearest = [anchor.p, entry, p];
-    gap = d;
+  const contacts = [], vertices = new Map();
+  const root = id => {
+    while (contacts[id].parent !== id) {
+      contacts[id].parent = contacts[contacts[id].parent].parent;
+      id = contacts[id].parent;
+    }
+    return id;
   };
+  const covers = p => outline ?
+    inCopper(p, outline) || (fringe > 0 && outline.some(([a, b]) => distance(p, project(p, a, b).p) <= fringe + EPS)) :
+    distance(anchor.p, p) <= reach + EPS;
   for (const [a, b] of edges) {
     if (Math.max(a.x, b.x) < anchor.p.x - reach - EPS || Math.min(a.x, b.x) > anchor.p.x + reach + EPS ||
         Math.max(a.y, b.y) < anchor.p.y - reach - EPS || Math.min(a.y, b.y) > anchor.p.y + reach + EPS) continue;
+    let nearest, gap = Infinity;
+    const consider = (p, entry = p) => {
+      const d = distance(anchor.p, entry) + distance(entry, p);
+      if (d >= gap) return;
+      if (outline ? !inCopper(entry, outline) : d > reach + EPS) return;
+      nearest = [anchor.p, entry, p];
+      gap = d;
+    };
     consider(project(anchor.p, a, b).p);
     if (outline) {
       for (const [c, d] of outline) {
@@ -1360,8 +1371,24 @@ function copperContact(anchor, edges, stroke = 0) {
         }
       }
     }
+    if (!nearest) continue;
+    const id = contacts.length;
+    contacts.push({ parent: id, path: nearest, length: gap });
+    // Adjacent boundary pieces inside the pad form one contact. Separate
+    // spokes or islands keep their own entry into the copper graph.
+    for (const vertex of [a, b]) {
+      if (!covers(vertex)) continue;
+      const key = keyOf(vertex, '');
+      if (vertices.has(key)) contacts[root(id)].parent = root(vertices.get(key));
+      else vertices.set(key, id);
+    }
   }
-  return nearest;
+  const entries = new Map();
+  for (const [id, contact] of contacts.entries()) {
+    const group = root(id);
+    if (!entries.has(group) || entries.get(group).length > contact.length) entries.set(group, contact);
+  }
+  return [...entries.values()].map(contact => contact.path);
 }
 
 function computeRoutes(model, start, end, board) {
@@ -1494,13 +1521,14 @@ function* routeSearch(model, start, end, board, trace = () => {}) {
       ports.set(id, p);
     };
     const connectAnchor = anchor => {
-      const path = copperContact(anchor, edges, plane.stroke);
-      if (!path || !segmentIn(path[0], path[1], board.edges, inside) ||
-          !segmentIn(path[1], path[2], board.edges, inside)) return;
-      const contact = path.at(-1);
-      addPort(contact);
-      graph.connect(graph.node(anchor.p, plane.layer), graph.node(contact, plane.layer),
-        distance(path[0], path[1]) + distance(path[1], path[2]), 'pad', path, [plane.layer]);
+      for (const path of copperContacts(anchor, edges, plane.stroke)) {
+        if (!segmentIn(path[0], path[1], board.edges, inside) ||
+            !segmentIn(path[1], path[2], board.edges, inside)) continue;
+        const contact = path.at(-1);
+        addPort(contact);
+        graph.connect(graph.node(anchor.p, plane.layer), graph.node(contact, plane.layer),
+          distance(path[0], path[1]) + distance(path[1], path[2]), 'pad', path, [plane.layer]);
+      }
     };
     for (const terminal of terminals) {
       if (!terminal.layers.includes(plane.layer) || !inside(terminal.p)) continue;
@@ -1625,6 +1653,14 @@ function* routeSearch(model, start, end, board, trace = () => {}) {
     }
     return root;
   });
+  for (const [index, terminal] of terminals.entries()) {
+    const exits = terminal.layers.flatMap(layer => graph.nodes[graph.node(terminal.p, layer)].edges
+      .filter(edge => edge.kind !== 'via' && edge.kind !== 'endpoint')
+      .map(edge => ({ layer, kind: edge.kind,
+        p: edge.path.find(p => distance(terminal.p, p) > SNAP) || graph.nodes[edge.to].p })));
+    trace('solver.endpoint-exits', { role: index ? 'end' : 'start', id: terminal.id, p: terminal.p,
+      count: exits.length, exits: exits.slice(0, 32) });
+  }
   const refinementBudget = { remaining: COPPER_REFINEMENT_BUDGET };
   const { suppressed, count: mergedVias, limited: mergeLimited } =
     yield* suppressNearbyVias(graph, model.anchors, terminals, meshPlanes, board, inside);

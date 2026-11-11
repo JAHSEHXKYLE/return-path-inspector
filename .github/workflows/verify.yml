@@ -23,16 +23,27 @@ jobs:
         with:
           python-version: '3.12'
       - name: Run regression tests
-        run: node --test test/popup.test.cjs test/return-path.test.cjs
+        run: |
+          node --test test/popup.test.cjs test/return-path.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s test -p 'test_*.py' -v
       - name: Build and verify extension package
         run: |
+          $version = (Get-Content -LiteralPath extension.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw '标签与扩展版本不一致' }
           python build.py
-          $package = Get-ChildItem build/dist -Filter '*.eext' | Select-Object -First 1
-          python -m zipfile -t $package.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = Get-Item -LiteralPath "build/dist/return-path-inspector_v$version.eext"
+          python build.py --verify $package.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checksum = (Get-Content -LiteralPath "$($package.FullName).sha256").Split(' ')[0]
+          if ((Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash -ne $checksum) { throw '安装包校验值不一致' }
       - uses: actions/upload-artifact@v7
         with:
           name: easyeda-extension
-          path: build/dist/*.eext
+          path: |
+            build/dist/*.eext
+            build/dist/*.sha256
           if-no-files-found: error
 
   release:
@@ -57,10 +68,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $package = Get-Item -LiteralPath "release/return-path-inspector_$env:RELEASE_TAG.eext"
+          $checksumFile = Get-Item -LiteralPath "$($package.FullName).sha256"
+          $checksum = (Get-Content -LiteralPath $checksumFile.FullName).Split(' ')[0]
+          if ((Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash -ne $checksum) { throw '发布包校验值不一致' }
           $changelog = Get-Content -LiteralPath CHANGELOG.md -Raw -Encoding utf8
           $pattern = '(?ms)^## ' + [regex]::Escape($env:RELEASE_TAG) + '\r?\n(.*?)(?=^## |\z)'
           $entry = [regex]::Match($changelog, $pattern)
           if (-not $entry.Success) { throw "更新日志中找不到版本 $env:RELEASE_TAG" }
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           [System.IO.File]::WriteAllText($notes, $entry.Groups[1].Value.Trim(), [System.Text.UTF8Encoding]::new($false))
-          gh release create $env:RELEASE_TAG $package.FullName --verify-tag --title "回流路径检查 $env:RELEASE_TAG" --notes-file $notes
+          gh release create $env:RELEASE_TAG $package.FullName $checksumFile.FullName --verify-tag --title "回流路径检查 $env:RELEASE_TAG" --notes-file $notes
