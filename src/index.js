@@ -1,45 +1,41 @@
-const LIMIT = 80;
+const ROUTES_PER_PAGE = 50;
+const PREVIEW_POINT_LIMIT = 16000;
+const PREVIEW_ROUTE_LIMIT = 512;
+const PREVIEW_BOUNDARY_LIMIT = 160000;
 const MAX_PAIRS = 8;
+const INACTIVE_PATH_WIDTH = 0.8;
+const INACTIVE_PATH_COLOR = '#858585';
+const DEBUG_LOG_LINES = 1000;
+const DEBUG_LOG_CHARS = 192 * 1024;
 
 function formatLengthMm(mil) {
   return (mil * 0.0254).toFixed(3);
 }
 
-function shortestPerDisplayedLength(sortedRoutes) {
-  const seen = new Set();
-  return sortedRoutes.filter(route => {
-    const displayedLength = formatLengthMm(route.length);
-    if (seen.has(displayedLength)) return false;
-    seen.add(displayedLength);
-    return true;
-  });
-}
-
-function combineRoutes(groups, limit = LIMIT) {
-  if (!groups.length || groups.some(group => !group.routes.length)) return { routes: [], truncated: false };
-  const heap = new MinHeap(), seen = new Set(), routes = [];
+function* combineRoutes(groups) {
+  if (!groups.length || groups.some(group => !group.routes.length)) return;
+  const heap = new MinHeap();
   const enqueue = indices => {
-    const key = indices.join(',');
-    if (seen.has(key)) return;
-    seen.add(key);
     heap.push(indices, indices.reduce((sum, j, i) => sum + groups[i].routes[j].length, 0));
   };
   enqueue(groups.map(() => 0));
-  while (heap.size && routes.length < limit) {
+  while (heap.size) {
     const { value: indices, rank } = heap.pop();
     const parts = indices.map((j, i) => ({
       label: groups[i].label, index: j + 1, length: groups[i].routes[j].length,
       edgeCount: groups[i].routes[j].edges.length,
     }));
-    routes.push({ length: rank, parts, edges: indices.flatMap((j, i) => groups[i].routes[j].edges) });
+    yield { length: rank, parts };
     for (let i = 0; i < indices.length; i++) {
-      if (indices[i] + 1 >= groups[i].routes.length) continue;
-      const next = indices.slice();
-      next[i]++;
-      enqueue(next);
+      if (indices[i] + 1 < groups[i].routes.length) {
+        const next = indices.slice();
+        next[i]++;
+        enqueue(next);
+      }
+      // Each vector has one predecessor, obtained by decrementing its first nonzero index.
+      if (indices[i]) break;
     }
   }
-  return { routes, truncated: heap.size > 0 || groups.some(group => group.truncated) };
 }
 
 const WINDOW_ID = 'return-path-results';
@@ -56,7 +52,45 @@ let session = null;
 let queue = Promise.resolve();
 let busReady = false;
 
+function debugEvent(s, name, detail = {}, level = 'DEBUG') {
+  const log = s?.debugLog;
+  if (!log) return;
+  let fields;
+  try { fields = JSON.stringify(detail); }
+  catch { fields = '{"detail":"无法序列化"}'; }
+  const row = new Date().toISOString() + ' [' + level + '] ' + name + ' ' + fields;
+  const line = row.length <= 1600 ? row : row.slice(0, 1586) + ' …[截断]';
+  log.lines.push(line);
+  log.chars += line.length + 1;
+  while (log.lines.length > DEBUG_LOG_LINES || log.chars > DEBUG_LOG_CHARS) {
+    log.chars -= log.lines.shift().length + 1;
+    log.dropped++;
+  }
+}
+
+function debugError(s, name, error) {
+  debugEvent(s, name, { message: error?.message || String(error), type: error?.name,
+    stack: typeof error?.stack === 'string' ? error.stack.split('\n').slice(1, 6).map(line => line.trim()) : undefined }, 'ERROR');
+}
+
+function exportDebugLog(s) {
+  const log = s.debugLog;
+  if (!log) return;
+  debugEvent(s, 'log.export', { calculating: Boolean(s.progress), stage: s.progress });
+  const timestamp = new Date().toISOString();
+  const text = [
+    '回流路径检查 v' + EXTENSION_VERSION + ' · PCB 调试日志',
+    '会话开始 ' + log.startedAt + ' · 导出 ' + timestamp + ' · 时间为 UTC',
+    '记录 ' + log.lines.length + ' 条' + (log.dropped ? ' · 超出预算丢弃最早的 ' + log.dropped + ' 条' : ''),
+    '', ...log.lines, '',
+  ].join('\r\n');
+  eda.sys_MessageBus.publish(BUS + 'debugLog', JSON.stringify({
+    token: s.token, text, filename: 'return-path-v' + EXTENSION_VERSION + '-' + timestamp.replace(/[:.]/g, '-') + '.log',
+  }));
+}
+
 function logRun(message, type = 'info') {
+  debugEvent(session, 'eda.log', { message }, type.toUpperCase());
   try {
     eda.sys_Log?.add('[回流路径] ' + message, type);
   } catch { /* Logging must not interrupt selection or calculation. */ }
@@ -67,6 +101,7 @@ function enqueue(operation) {
   queue = result.catch(async error => {
     if (error instanceof PathCancelled) return;
     const message = error?.message || String(error);
+    debugError(session, 'operation.error', error);
     logRun(message, 'error');
     try {
       if (session) {
@@ -218,10 +253,15 @@ async function readBoardForCalculation(s) {
   }
 }
 
-async function savePreview(doc, { paths, vias }, width, checkCancelled = () => {}) {
-  const shapes = paths.map(({ points: [start, ...rest] }) =>
-    [start.x, start.y, 'L', ...rest.flatMap(p => [p.x, p.y])]);
-  for (const { p, r } of vias) shapes.push(['CIRCLE', p.x, p.y, r]);
+async function savePreview(doc, active, width, checkCancelled = () => {}, inactive) {
+  const shapes = [];
+  for (const [preview, weight] of [[inactive, INACTIVE_PATH_WIDTH], [active, width]]) {
+    if (!preview) continue;
+    for (const { points: [start, ...rest] } of preview.paths) {
+      shapes.push({ source: [start.x, start.y, 'L', ...rest.flatMap(p => [p.x, p.y])], weight });
+    }
+    for (const { p, r } of preview.vias) shapes.push({ source: ['CIRCLE', p.x, p.y, r], weight });
+  }
   if (!shapes.length) return null;
   if (shapes.length > 1800) throw new Error('预览图元超过 1800 个，未写入自定义层。弹窗仍可查看路径。');
 
@@ -244,9 +284,9 @@ async function savePreview(doc, { paths, vias }, width, checkCancelled = () => {
     for (let i = 0; i < shapes.length; i += 12) {
       await ensureCurrent(doc);
       checkCancelled();
-      const results = await Promise.allSettled(shapes.slice(i, i + 12).map(async source => {
+      const results = await Promise.allSettled(shapes.slice(i, i + 12).map(async ({ source, weight }) => {
         const polygon = eda.pcb_MathPolygon.createPolygon(source);
-        const line = await eda.pcb_PrimitivePolyline.create('', preview.layer, polygon, width, false);
+        const line = await eda.pcb_PrimitivePolyline.create('', preview.layer, polygon, weight, false);
         const id = state(line, 'PrimitiveId');
         if (!id) throw new Error('创建预览线失败。');
         return id;
@@ -272,6 +312,26 @@ function activeResult(s) {
   return s.mode === 'joint' ? s.joint : s.groups[s.group];
 }
 
+function routeCount(s) {
+  return s.mode === 'joint' ? s.joint?.count ?? 0n : BigInt(activeResult(s)?.routes.length ?? 0);
+}
+
+function loadJointEntries(s, end) {
+  const joint = s.joint;
+  if (s.mode !== 'joint' || !joint) return;
+  while (joint.entries.length < end && BigInt(joint.entries.length) < joint.count) {
+    joint.entries.push(joint.combinations.next().value);
+  }
+  if (BigInt(joint.entries.length) === joint.count) joint.combinations.return();
+}
+
+function routeAt(s, index) {
+  if (s.mode !== 'joint') return activeResult(s)?.routes[index];
+  const entry = s.joint?.entries[index];
+  if (!entry) return;
+  return { ...entry, edges: entry.parts.flatMap((part, i) => s.groups[i].routes[part.index - 1].edges) };
+}
+
 function visibleLayer(s, id) {
   const item = s.layers.find(layer => layer.id === id);
   if (!item) return false;
@@ -282,16 +342,33 @@ function visibleLayer(s, id) {
 }
 
 function publicSession(s) {
+  const offset = s.page * ROUTES_PER_PAGE;
+  const end = offset + ROUTES_PER_PAGE;
+  const count = routeCount(s);
+  const pages = (count + BigInt(ROUTES_PER_PAGE - 1)) / BigInt(ROUTES_PER_PAGE);
   return {
-    token: s.token, notice: s.notice, progress: s.progress, pairs: s.pairs, groups: s.groups, joint: s.joint,
+    token: s.token, notice: s.notice, progress: s.progress, pairs: s.pairs,
+    groups: s.groups.map(({ routes, ...group }, i) => ({
+      ...group, routes: s.mode === 'separate' && s.group === i ? routes.slice(offset, end).map(route => ({
+        length: route.length,
+        edges: route.edges.map(({ kind, layers, length, path }) => ({
+          kind, layers, length, path: kind === 'via' ? path : undefined,
+        })),
+      })) : [],
+    })),
+    joint: { routes: s.joint?.entries.slice(offset, end) || [] },
+    routePage: { index: s.page, offset, count: String(count), pages: String(pages),
+      hasNext: BigInt(end) < count },
     mode: s.mode, group: s.group, selected: s.selected, layers: s.layers,
+    resultRevision: s.resultRevision, previewRequest: s.previewRequest,
     currentLayer: s.currentLayer, activeLayerRead: s.activeLayerRead, manualLayer: s.manualLayer,
     display: s.display, colorMode: s.colorMode, layerStyles: s.layerStyles, defaultPathWidth: 3.5,
     curveDensity: s.curveDensity, workspaceWidth: s.workspaceWidth, activePreview: s.activePreview,
+    showAllRoutes: s.showAllRoutes, inactivePreview: s.inactivePreview,
     visibleLayers: s.layers.filter(layer => visibleLayer(s, layer.id)).map(layer => layer.id),
     previewLayer: s.previewLayer, markerWarning: s.markerWarning,
     manualDepthsMm: s.manualDepthsMm, autoDepthsMm: s.autoDepthsMm,
-    boardThicknessMm: s.boardThicknessMm, stackup: currentStackup(s), taskActive: Boolean(s.hint),
+    boardThicknessMm: s.boardThicknessMm, stackup: currentStackup(s), taskActive: Boolean(s.hint || s.progress),
   };
 }
 
@@ -322,7 +399,9 @@ async function readView(s) {
   s.currentLayer = s.manualLayer ?? exposed ?? previous?.id ?? shown[0]?.id ?? s.layers[0]?.id;
   const mode = active?.inactiveLayerDisplayMode ?? config?.inactiveLayerDisplayMode;
   s.hostMode = [0, 1, 2].includes(Number(mode)) ? Number(mode) : undefined;
-  return JSON.stringify([s.layers, s.currentLayer, s.hostMode, s.activeLayerRead]) !== before;
+  const changed = JSON.stringify([s.layers, s.currentLayer, s.hostMode, s.activeLayerRead]) !== before;
+  if (changed) debugEvent(s, 'pcb.view', { currentLayer: s.currentLayer, hostMode: s.hostMode, layers: s.layers });
+  return changed;
 }
 
 function markerLine(a, b) {
@@ -347,28 +426,40 @@ async function drawMarkers(s) {
   s.markerWarning = '';
   if (!s.windowOpen || !s.activePreview) return;
   const groups = new Map();
-  const add = (shape, layer) => {
+  const add = (shape, layer, active) => {
     const style = s.layerStyles[layer];
     const edaColor = s.layers.find(item => item.id === layer)?.color;
-    const color = s.colorMode === 'mono' ? FALLBACK_COLOR :
+    const color = !active ? INACTIVE_PATH_COLOR : s.colorMode === 'mono' ? FALLBACK_COLOR :
       (s.colorMode === 'custom' ? style?.color : undefined) || edaColor;
-    if (!groups.has(color)) groups.set(color, { color: markerColor(color, 1), shapes: [] });
-    groups.get(color).shapes.push(shape);
+    const width = active ? s.workspaceWidth : INACTIVE_PATH_WIDTH;
+    const key = color + ':' + width;
+    if (!groups.has(key)) groups.set(key, { color: markerColor(color, 1), width, shapes: [] });
+    groups.get(key).shapes.push(shape);
   };
-  for (const { layer, points } of s.activePreview.paths) {
-    for (let i = 1; i < points.length; i++) add(markerLine(points[i - 1], points[i]), layer);
-  }
-  for (const { layer, p, r } of s.activePreview.vias) {
-    add({ type: 'circle', x: p.x, y: p.y, r }, layer);
+  const seen = new Set();
+  for (const [preview, active] of [[s.activePreview, true], [s.inactivePreview, false]]) {
+    if (!preview) continue;
+    for (const { layer, points } of preview.paths) {
+      for (let i = 1; i < points.length; i++) {
+        const a = keyOf(points[i - 1], layer), b = keyOf(points[i], layer);
+        const key = a < b ? a + '|' + b : b + '|' + a;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        add(markerLine(points[i - 1], points[i]), layer, active);
+      }
+    }
+    for (const { layer, p, r } of preview.vias) add({ type: 'circle', x: p.x, y: p.y, r }, layer, active);
   }
 
   if ([...groups.values()].reduce((sum, group) => sum + group.shapes.length, 0) > 2800) {
     s.markerWarning = '画布标记超出显示上限，将尝试使用预览层。';
     return;
   }
-  for (const { shapes, color } of groups.values()) {
+  // Paint the selected route last so it stays visible above shared copper.
+  for (const { shapes, color, width } of [...groups.values()].reverse()) {
+    checkRunning(s);
     try {
-      if (!await eda.dmt_EditorControl.generateIndicatorMarkers(shapes, color, s.workspaceWidth, false, s.doc.tabId)) {
+      if (!await eda.dmt_EditorControl.generateIndicatorMarkers(shapes, color, width, false, s.doc.tabId)) {
         throw new Error('画布标记不可用。');
       }
       s.drawn = true;
@@ -382,7 +473,7 @@ async function drawMarkers(s) {
 
 function startViewPolling(s) {
   const tick = () => setTimeout(() => {
-    if (session !== s || !s.windowOpen) return;
+    if (session !== s || !s.windowOpen || s.cancelled) return;
     void enqueue(async () => {
       try {
         if (session === s && s.windowOpen && await readView(s)) {
@@ -390,7 +481,7 @@ function startViewPolling(s) {
           send();
         }
       } catch { /* Another editor tab may be active. */ }
-      if (session === s && s.windowOpen) tick();
+      if (session === s && s.windowOpen && !s.cancelled) tick();
     });
   }, 500);
   tick();
@@ -412,20 +503,89 @@ async function restorePreviewLayer(s, useAsFallback = false) {
 }
 
 async function refreshWorkspacePreview(s) {
+  const started = Date.now();
   await ensureCurrent(s.doc);
   checkRunning(s);
-  const routes = activeResult(s)?.routes || [];
-  const route = routes[Math.max(0, s.selected)] || routes[0];
   if (!s.previewBoard) return;
-  s.activePreview = buildRoutePreview(route, layer => visibleLayer(s, layer), s.curveDensity,
-    s.previewBoard, s.previewRegions);
-  const key = JSON.stringify([s.workspaceWidth, s.activePreview]);
+  const selected = Math.max(0, s.selected);
+  const route = routeAt(s, selected);
+  const previewCount = routeCount(s);
+  let previewNotice = '';
+  const visible = new Set(s.layers.filter(layer => visibleLayer(s, layer.id)).map(layer => layer.id));
+  const viewKey = [s.curveDensity, ...visible].join(',');
+  const result = activeResult(s);
+  if (s.routePreviews?.viewKey !== viewKey || s.routePreviews?.result !== result) {
+    s.routePreviews = { viewKey, result, items: new Map(), points: 0 };
+  }
+  const cache = s.routePreviews;
+  const pointCount = preview => preview.paths.reduce((sum, path) => sum + path.points.length, preview.vias.length);
+  const previewOf = (index, item) => {
+    if (cache.items.has(index)) return cache.items.get(index);
+    const points = item.edges.reduce((total, edge) => total + edge.path.length, 0);
+    if (points > PREVIEW_POINT_LIMIT) return { paths: [], vias: [], limited: true };
+    const density = (s.curveDensity * 3 + 1) * points <= PREVIEW_POINT_LIMIT ? s.curveDensity : 0;
+    const preview = buildRoutePreview(item, layer => visible.has(layer), density, s.previewBoard, s.previewRegions);
+    const count = pointCount(preview);
+    if (cache.items.size < PREVIEW_ROUTE_LIMIT && cache.points + count <= PREVIEW_POINT_LIMIT) {
+      cache.items.set(index, preview);
+      cache.points += count;
+    }
+    return preview;
+  };
+  s.activePreview = route ? previewOf(selected, route) : { paths: [], vias: [] };
+  if (s.activePreview.limited) previewNotice = '选中路线超出预览几何预算，可在列表查看长度和换层信息。';
+  s.inactivePreview = undefined;
+  if (s.showAllRoutes && route && previewCount > 1n) {
+    const pathKey = ({ layer, points }) => {
+      const coords = points.map(p => keyOf(p, layer));
+      if (coords[0] > coords.at(-1)) coords.reverse();
+      return coords.join('|');
+    };
+    const viaKey = ({ p, layer }) => keyOf(p, layer);
+    const paths = [], vias = [];
+    const seenPaths = new Set(s.activePreview.paths.map(pathKey));
+    const seenVias = new Set(s.activePreview.vias.map(viaKey));
+    const addUnique = (items, keys, output, keyOfItem, routeIndex) => {
+      for (const item of items) {
+        const key = keyOfItem(item);
+        if (keys.has(key)) continue;
+        keys.add(key);
+        output.push({ ...item, routeIndex });
+      }
+    };
+    let points = pointCount(s.activePreview);
+    let sliceStarted = Date.now(), processed = 1;
+    for (let index = 0; BigInt(index) < previewCount; index++) {
+      if (index === selected) continue;
+      if (processed >= PREVIEW_ROUTE_LIMIT) {
+        previewNotice = '画布叠加已达到预览容量，其他路线可在列表逐条查看。';
+        break;
+      }
+      if (Date.now() - sliceStarted >= 24) {
+        await new Promise(resolve => setTimeout(resolve, 32));
+        checkRunning(s);
+        sliceStarted = Date.now();
+      }
+      loadJointEntries(s, index + 1);
+      const preview = previewOf(index, routeAt(s, index));
+      processed++;
+      points += pointCount(preview);
+      if (preview.limited || points > PREVIEW_POINT_LIMIT) {
+        previewNotice = '全部叠加达到预览几何预算，剩余路线可在列表逐条选择。';
+        break;
+      }
+      addUnique(preview.paths, seenPaths, paths, pathKey, index);
+      addUnique(preview.vias, seenVias, vias, viaKey, index);
+    }
+    s.inactivePreview = { paths, vias };
+  }
+  const key = JSON.stringify([s.workspaceWidth, s.activePreview, s.inactivePreview]);
   let storageWarning = '';
   if (key !== s.previewKey) {
     try {
       await clearStoredPreview(s.doc);
       s.previewStale = false;
-      const layer = await savePreview(s.doc, s.activePreview, s.workspaceWidth, () => checkRunning(s));
+      const layer = await savePreview(s.doc, s.activePreview, s.workspaceWidth, () => checkRunning(s), s.inactivePreview);
       if (layer) {
         s.previewLayer = layer;
         if (s.progress) s.wrotePreview = true;
@@ -452,7 +612,34 @@ async function refreshWorkspacePreview(s) {
   checkRunning(s);
   if (s.drawn && !s.markerWarning) await hidePreviewLayer(s);
   else await restorePreviewLayer(s, true);
-  if (storageWarning) s.markerWarning = [s.markerWarning, storageWarning].filter(Boolean).join(' ');
+  s.markerWarning = [s.markerWarning, storageWarning, previewNotice].filter(Boolean).join(' ');
+  const transitions = [];
+  for (const edge of route?.edges || []) {
+    if (edge.kind !== 'via') continue;
+    transitions.push({ p: edge.path[0], layers: edge.layers, lengthMm: formatLengthMm(edge.length) });
+    if (transitions.length === 8) break;
+  }
+  debugEvent(s, 'preview.render', { mode: s.mode, group: s.group + 1, route: selected + 1,
+    showAll: s.showAllRoutes, visible: [...visible], widthMil: s.workspaceWidth,
+    lengthMm: route ? formatLengthMm(route.length) : undefined, transitionSample: transitions,
+    paths: s.activePreview.paths.length, vias: s.activePreview.vias.length, alternatePaths: s.inactivePreview?.paths.length,
+    previewLayer: s.previewLayer, markers: s.drawn, warning: s.markerWarning, elapsedMs: Date.now() - started });
+}
+
+function finishResultsWindow(s, nativeClose) {
+  if (session !== s || !s.windowOpen) return;
+  s.debugLog = undefined;
+  if (s.hint || s.progress) {
+    if (nativeClose) s.windowOpen = false;
+    return requestCancel(s);
+  }
+  s.windowOpen = false;
+  return enqueue(async () => {
+    await closeHint(s);
+    await removeMarkers(s);
+    await restorePreviewLayer(s);
+    if (!nativeClose) await eda.sys_IFrame.closeIFrame(WINDOW_ID);
+  });
 }
 
 async function openResults(s) {
@@ -467,6 +654,9 @@ async function openResults(s) {
     title: WINDOW_TITLE,
     grayscaleMask: false,
     maximizeButton: true,
+    minimizeButton: true,
+    minimizeStyle: 'collapsed',
+    onBeforeCloseCallFn: () => { void finishResultsWindow(s, true); },
   });
   if (!opened) {
     s.windowOpen = false;
@@ -548,20 +738,44 @@ async function closeHint(s) {
   await eda.sys_IFrame.closeIFrame(HINT_ID);
 }
 
+function discardResults(s) {
+  s.joint?.combinations.return();
+  s.joint = null;
+  s.resultRevision = (s.resultRevision ?? 0) + 1;
+  s.groups = [];
+  s.page = 0;
+  s.activePreview = undefined;
+  s.inactivePreview = undefined;
+  s.routePreviews = undefined;
+  s.previewBoard = undefined;
+  s.previewRegions = undefined;
+  s.previewKey = undefined;
+}
+
 function requestCancel(s) {
-  if (session !== s || !s.hint || s.cancelled) return;
+  if (session !== s || !(s.hint || s.progress) || s.cancelled) return;
   s.cancelled = true;
+  s.debugLog = undefined;
+  s.activeSearch?.return();
+  s.activeSearch = undefined;
+  discardResults(s);
+  s.resolveHintReady?.(undefined);
   stopPicking();
   return enqueue(async () => {
-    s.pending = null;
-    await closeHint(s);
-    if (s.windowOpen) {
-      s.windowOpen = false;
-      await eda.sys_IFrame.closeIFrame(WINDOW_ID);
+    try {
+      s.pending = null;
+      s.pairs = [];
+      await closeHint(s);
+      if (s.windowOpen) {
+        s.windowOpen = false;
+        await eda.sys_IFrame.closeIFrame(WINDOW_ID);
+      }
+      await removeMarkers(s);
+      if (s.restorePreview) await restorePreviewLayer(s);
+      logRun('已取消回流路径检查。');
+    } finally {
+      if (session === s) session = null;
     }
-    await removeMarkers(s);
-    if (s.restorePreview) await restorePreviewLayer(s);
-    logRun('已取消回流路径检查。');
   });
 }
 
@@ -578,6 +792,8 @@ async function startPick(s, quick) {
   let lastIgnoredType;
   eda.pcb_Event.addMouseEventListener(PICK_ID, 'selected', (_, hits) => {
     if (session !== s || s.pickBusy || s.cancelled) return;
+    debugEvent(s, 'selection.click', { count: hits?.length || 0,
+      hits: (hits || []).slice(0, 8).map(item => [item.primitiveType, item.primitiveId, item.net]) });
     const hit = pickable.map(type => hits?.find(item => item.primitiveType === type)).find(Boolean);
     if (!hit) {
       const types = [...new Set((hits || []).map(item => item.primitiveType).filter(Boolean))].join('、');
@@ -598,6 +814,9 @@ async function startPick(s, quick) {
         const endpoint = await readEndpoint(hit, await cursor, s.layers.map(layer => layer.id),
           s.layers.filter(layer => layer.status === 1).map(layer => layer.id), s.curveDensity);
         checkRunning(s);
+        debugEvent(s, 'selection.endpoint', { role: s.pending ? 'end' : 'start', pair: pairLetter,
+          hitType: hit.primitiveType, id: endpoint.id, label: endpoint.label, net: endpoint.net, p: endpoint.p,
+          layers: endpoint.layers, radiusMil: endpoint.radius, track: Boolean(endpoint.track), via: Boolean(endpoint.via) });
         if (s.pending?.id === endpoint.id && distance(s.pending.p, endpoint.p) < SNAP) {
           logRun('再次命中起始点，请选择不同的流入点。', 'warn');
           notify('请选择不同的流入点。');
@@ -650,15 +869,36 @@ async function reportProgress(s, text) {
 }
 
 async function solveWithProgress(s, label, model, pair, board) {
-  const search = routeSearch(model, pair.start, pair.end, board, LIMIT);
-  let lastPaint = Date.now();
-  for (let step = search.next(); ; step = search.next()) {
-    if (step.done) return step.value;
-    const text = label + ' · ' + step.value;
-    if (s.progress !== text || Date.now() - lastPaint >= 100) {
-      await reportProgress(s, text);
-      lastPaint = Date.now();
+  const search = routeSearch(model, pair.start, pair.end, board, (event, detail) =>
+    debugEvent(s, event, { pair: pair.label, ...detail }));
+  s.activeSearch = search;
+  let lastPaint = Date.now(), lastStage, stageStart = lastPaint, lastTrace = lastPaint;
+  try {
+    while (true) {
+      checkRunning(s);
+      const step = search.next();
+      if (step.done) {
+        debugEvent(s, 'solver.done', { pair: pair.label, stage: lastStage, elapsedMs: Date.now() - stageStart });
+        return step.value;
+      }
+      const { stage, detail } = typeof step.value === 'string' ? { stage: step.value } : step.value;
+      const now = Date.now();
+      if (lastStage !== stage || (detail && now - lastTrace >= 1000)) {
+        debugEvent(s, 'solver.stage', { pair: pair.label, stage, detail, previous: lastStage,
+          previousStageMs: lastStage === stage ? undefined : now - stageStart });
+        if (lastStage !== stage) stageStart = now;
+        lastTrace = now;
+      }
+      if (lastStage !== stage || Date.now() - lastPaint >= 100) {
+        const text = label + ' · ' + stage + (detail ? ' · ' + detail : '');
+        await reportProgress(s, text);
+        lastPaint = Date.now();
+        lastStage = stage;
+      }
     }
+  } finally {
+    search.return();
+    if (s.activeSearch === search) s.activeSearch = undefined;
   }
 }
 
@@ -689,6 +929,9 @@ async function calculatePaths(s, mode, mapping) {
   const pairs = s.pairs.map((pair, i) => ({
     start: pair.start, end: s.pairs[mapping[i]].end, label: letter(i) + '→' + letter(mapping[i]),
   }));
+  debugEvent(s, 'analysis.start', { mode, mapping, pairs: pairs.map(pair => ({
+    label: pair.label, start: pair.start.id, end: pair.end.id, startNet: pair.start.net, endNet: pair.end.net,
+  })) });
   logRun('开始' + (mode === 'joint' ? '共同' : '分开') + '计算，配对 ' + pairs.map(pair => pair.label).join('、') + '。');
   const good = pairs.filter(pair => {
     if (pair.start.net && pair.start.net === pair.end.net) return true;
@@ -703,13 +946,17 @@ async function calculatePaths(s, mode, mapping) {
   s.progress = '正在校验闭合板框';
   await openResults(s);
   await reportProgress(s, s.progress);
+  const boardStarted = Date.now();
   const board = good.length ? await readBoardForCalculation(s) : null;
   checkRunning(s);
+  debugEvent(s, 'analysis.board', { boundaryEdges: board?.edges.length, elapsedMs: Date.now() - boardStarted });
   for (const pair of good) {
     try { validateEnds(pair.start, pair.end, board); }
     catch (error) { pair.error = error.message; }
   }
   const invalid = pairs.filter(pair => pair.error);
+  debugEvent(s, 'analysis.validate', { valid: pairs.length - invalid.length,
+    rejected: invalid.map(pair => [pair.label, pair.error]) });
   if (invalid.length && (mode === 'joint' || invalid.length === pairs.length)) {
     throw new Error(invalid.map(pair => pair.label + ' ' + pair.error).join('\n'));
   }
@@ -720,83 +967,154 @@ async function calculatePaths(s, mode, mapping) {
   if (cleared) logRun('重新计算前已清除 ' + cleared + ' 条旧预览线。');
   s.previewLayer = null;
   s.restorePreview = false;
-  s.previewKey = undefined;
+  discardResults(s);
   s.previewStale = false;
-  s.activePreview = undefined;
   s.previewBoard = board;
-  s.groups = [];
-  s.joint = { routes: [], truncated: false };
+  s.previewRegions = new Map();
   const layerIds = s.layers.map(layer => layer.id);
   await reportProgress(s, '正在读取物理叠层');
   await ensureCurrent(s.doc);
   s.autoDepthsMm = await readCopperDepths(layerIds);
   const stackup = currentStackup(s);
   const depthsMm = stackup.depths;
+  debugEvent(s, 'analysis.stackup', { source: stackup.source, depthsMm, boardThicknessMm: s.boardThicknessMm });
   if (depthsMm) logRun('换层距离来源 · ' + ({ physical: 'EDA 物理叠层', manual: '手动铜层深度',
     estimate: '板厚 ' + s.boardThicknessMm + ' mm · ' + layerIds.length + ' 层估算' })[stackup.source] + '。');
-  const models = new Map();
+  const models = new Map(), lastPairForNet = new Map();
+  let previewBoundaryCount = 0;
   for (const [index, pair] of pairs.entries()) {
-    const group = { ...pair, routes: [], warnings: [], truncated: false };
+    if (!pair.error) lastPairForNet.set(pair.start.net, index);
+  }
+  for (const [index, pair] of pairs.entries()) {
+    const group = { ...pair, routes: [], warnings: [] };
     if (!pair.error) {
+      const net = pair.start.net;
       try {
         const label = '第 ' + (index + 1) + ' / ' + pairs.length + ' 对 ' + pair.label;
         await reportProgress(s, label + ' · 读取同网络铜箔');
         await ensureCurrent(s.doc);
-        const net = pair.start.net;
         if (!models.has(net)) {
           const ends = pairs.filter(item => !item.error && item.start.net === net).flatMap(item => [item.start, item.end]);
-          models.set(net, await readNet(net, layerIds, ends, s.curveDensity));
+          const readStarted = Date.now();
+          const model = await readNet(net, layerIds, ends, s.curveDensity, () => checkRunning(s),
+            (event, detail) => debugEvent(s, event, { net, ...detail }));
+          models.set(net, model);
+          debugEvent(s, 'analysis.model', { net, tracks: model.tracks.length, anchors: model.anchors.length,
+            viaAnchors: model.anchors.filter(anchor => anchor.via).length, copperRegions: model.planes.length,
+            warningCount: model.warnings.length, elapsedMs: Date.now() - readStarted });
+        } else {
+          debugEvent(s, 'analysis.reuse-model', { pair: pair.label, net });
         }
         checkRunning(s);
         const model = models.get(net);
         Object.assign(group, await solveWithProgress(s, label, { ...model, depthsMm }, pair, board));
-        if (mode === 'separate') group.routes = shortestPerDisplayedLength(group.routes);
-        const beforeMerge = group.routes.length;
-        group.routes = shortestPerSimilarPath(group.routes);
-        if (group.routes.length < beforeMerge) {
-          logRun(group.label + ' · 已合并 ' + (beforeMerge - group.routes.length) + ' 条走向相近的候选。');
+        checkRunning(s);
+        if (group.mergedVias) {
+          group.warnings.push('合并了 ' + group.mergedVias + ' 个近邻过孔的重复换层分支。');
+        }
+        if (group.collapsedBranches || group.mergedRoutes) {
+          logRun(group.label + ' · 合并 ' + group.collapsedBranches + ' 条相近支路、' +
+            group.mergedRoutes + ' 条相似路线。');
+        }
+        if (group.limited) {
+          group.warnings.push('达到搜索或内存预算，列表显示已保留的路径。');
         }
         if (depthsMm && stackup.source === 'estimate' && model.anchors.some(anchor => anchor.layers.length > 1)) {
           group.warnings.push('换层距离按 ' + s.boardThicknessMm + ' mm 板厚估算，可在「过孔与换层长度」中调整。');
         }
-        if (!group.routes.length) group.error = group.incomplete || group.truncated
-          ? '搜索达到容量上限，未能确认这对点是否连通。'
+        if (!group.routes.length) group.error = group.incomplete || group.limited
+          ? '达到建模或搜索预算，未能确认这对点是否连通。'
           : '在已建模的同网络铜箔内未找到连通路径。';
+        const usedPlanes = new Set();
+        for (const route of group.routes) {
+          for (const edge of route.edges) if (edge.plane) usedPlanes.add(edge.plane);
+        }
+        let previewLimited = false;
+        for (const plane of model.planes) {
+          if (!usedPlanes.has(plane.id) || s.previewRegions.has(plane.id)) continue;
+          const count = board.edges.length + plane.rings.reduce((sum, ring) => sum + ring.length, 0);
+          if (previewBoundaryCount + count > PREVIEW_BOUNDARY_LIMIT) {
+            previewLimited = true;
+            continue;
+          }
+          const edges = plane.rings.flatMap(ringEdges);
+          s.previewRegions.set(plane.id, { contains: copperContains(edges, boundsOf(edges)), boundary: edges.concat(board.edges) });
+          previewBoundaryCount += count;
+        }
+        if (previewLimited) group.warnings.push('达到预览边界预算，部分铜区路线按原始线段显示。');
       } catch (error) {
         if (error instanceof PathCancelled) throw error;
+        debugError(s, 'analysis.' + pair.label + '.error', error);
         group.error = error.message;
+      } finally {
+        if (lastPairForNet.get(net) === index) models.delete(net);
       }
     }
     if (group.error) {
       logRun(group.label + ' · ' + group.error, pair.error ? 'error' : 'warn');
     } else {
-      logRun(group.label + ' · ' + group.routes.length + ' 条候选 · 最短 ' +
-        formatLengthMm(group.routes[0].length) + ' mm。');
+      const from = formatLengthMm(group.routes[0].length);
+      const to = formatLengthMm(group.routes.at(-1).length);
+      logRun(group.label + ' · ' + group.routes.length + ' 个可行解 · 长度 ' +
+        (from === to ? from : from + ' 至 ' + to) + ' mm。');
     }
     for (const warning of group.warnings) logRun(group.label + ' · ' + warning, 'warn');
-    if (group.truncated) logRun(group.label + ' · 已达到候选数量或计算上限。', 'warn');
     s.groups.push(group);
   }
   s.mode = mode;
   s.group = Math.max(0, s.groups.findIndex(group => group.routes.length));
   s.selected = -1;
-  s.joint = combineRoutes(s.groups);
-  s.previewRegions = new Map();
-  for (const model of models.values()) {
-    for (const plane of model.planes) {
-      const edges = plane.rings.flatMap(ringEdges);
-      s.previewRegions.set(plane.id, { contains: copperContains(edges, boundsOf(edges)), boundary: edges.concat(board.edges) });
-    }
+  if (mode === 'joint') {
+    const count = s.groups.reduce((total, group) => total * BigInt(group.routes.length), 1n);
+    s.joint = { entries: [], combinations: combineRoutes(s.groups), count };
+    loadJointEntries(s, ROUTES_PER_PAGE);
   }
-  s.notice = mode === 'joint' && !s.joint.routes.length ? '至少有一对没有可用路径，无法组成共同路线。' : '';
+  s.notice = mode === 'joint' && !s.joint.count ? '至少有一对没有可用路径，无法组成共同路线。' : '';
   if (s.notice) logRun(s.notice, 'warn');
   await reportProgress(s, '正在生成路径列表和画布预览');
   await refreshWorkspacePreview(s);
   checkRunning(s);
   if (s.markerWarning) logRun(s.markerWarning, 'warn');
-  logRun('计算结束，' + (mode === 'joint' ? '共同候选 ' + s.joint.routes.length + ' 条，' : '') +
+  logRun('计算结束，' + (mode === 'joint' ? '共同路线组合 ' + s.joint.count + ' 条，' : '') +
     '耗时 ' + (Date.now() - startedAt) + ' ms。');
   send();
+}
+
+async function updateView(s, data) {
+  if (typeof data.showAllRoutes === 'boolean') s.showAllRoutes = data.showAllRoutes;
+  if (['layer', 'custom', 'mono'].includes(data.colorMode) && s.colorMode !== data.colorMode) {
+    s.colorMode = data.colorMode;
+    await writeStyles(s);
+  }
+  if (['follow', 'current', 'all'].includes(data.display)) s.display = data.display;
+  if (data.manualLayer === null || s.layers.some(layer => layer.id === data.manualLayer)) {
+    s.manualLayer = data.manualLayer;
+  }
+  if (Number.isInteger(data.group) && data.group >= 0 && data.group < s.groups.length) {
+    s.group = data.group;
+    s.page = 0;
+    s.selected = -1;
+  }
+  const count = routeCount(s);
+  const picked = data.diagramRoute;
+  const { paths = [], vias = [] } = s.inactivePreview || {};
+  if (Number.isSafeInteger(picked) && picked >= 0 && BigInt(picked) < count && s.showAllRoutes &&
+      (paths.some(path => path.routeIndex === picked) || vias.some(via => via.routeIndex === picked))) {
+    s.selected = picked;
+    s.page = Math.floor(picked / ROUTES_PER_PAGE);
+    loadJointEntries(s, (s.page + 1) * ROUTES_PER_PAGE);
+  } else if (Number.isSafeInteger(data.page) && data.page >= 0 && Math.abs(data.page - s.page) === 1 &&
+      BigInt(data.page) * BigInt(ROUTES_PER_PAGE) < count) {
+    s.page = data.page;
+    s.selected = s.page * ROUTES_PER_PAGE;
+    loadJointEntries(s, s.selected + ROUTES_PER_PAGE);
+  }
+  if (Number.isSafeInteger(data.selected) && data.selected >= s.page * ROUTES_PER_PAGE &&
+      data.selected < (s.page + 1) * ROUTES_PER_PAGE && BigInt(data.selected) < count) {
+    s.selected = data.selected;
+  }
+  await readView(s);
+  await refreshWorkspacePreview(s);
 }
 
 function installBus() {
@@ -820,10 +1138,18 @@ function installBus() {
       if (session?.token === data.token) void requestCancel(session);
       return;
     }
+    if (data?.type === 'close' || data?.type === 'closed' || data?.type === 'exportLog') {
+      const s = session;
+      if (!s?.windowOpen || s.token !== data.token || s.cancelled) return;
+      if (data.type === 'exportLog') exportDebugLog(s);
+      else void finishResultsWindow(s, data.type === 'closed');
+      return;
+    }
     void enqueue(async () => {
       const s = session;
       if (!s || !data || !s.windowOpen || s.cancelled) return;
       if (data.token !== s.token) return;
+      debugEvent(s, 'ui.action', { ...data, token: undefined });
       if (data.type === 'pick') {
         await startPick(s, false);
       } else if (data.type === 'calculate') {
@@ -862,12 +1188,6 @@ function installBus() {
         await writeStyles(s);
         s.notice = '换层长度设置将在下次计算时应用。';
         send();
-      } else if (data.type === 'close' || data.type === 'closed') {
-        s.windowOpen = false;
-        await closeHint(s);
-        await removeMarkers(s);
-        await restorePreviewLayer(s);
-        if (data.type === 'close') await eda.sys_IFrame.closeIFrame(WINDOW_ID);
       } else if (data.type === 'style') {
         await readView(s);
         if (!s.layers.some(layer => layer.id === data.layer)) return;
@@ -885,25 +1205,12 @@ function installBus() {
         await refreshWorkspacePreview(s);
         send();
       } else if (data.type === 'view') {
-        if (['layer', 'custom', 'mono'].includes(data.colorMode) && s.colorMode !== data.colorMode) {
-          s.colorMode = data.colorMode;
-          await writeStyles(s);
+        try {
+          await updateView(s, data);
+        } finally {
+          if (Number.isSafeInteger(data.previewRequest)) s.previewRequest = data.previewRequest;
+          if (session === s) send();
         }
-        if (['follow', 'current', 'all'].includes(data.display)) s.display = data.display;
-        if (data.manualLayer === null || s.layers.some(layer => layer.id === data.manualLayer)) {
-          s.manualLayer = data.manualLayer;
-        }
-        if (Number.isInteger(data.group) && data.group >= 0 && data.group < s.groups.length) {
-          s.group = data.group;
-          s.selected = -1;
-        }
-        const result = activeResult(s);
-        if (Number.isInteger(data.selected) && data.selected >= -1 && data.selected < (result?.routes.length || 0)) {
-          s.selected = data.selected;
-        }
-        await readView(s);
-        await refreshWorkspacePreview(s);
-        send();
       }
     });
   });
@@ -915,12 +1222,7 @@ async function clear(s) {
   stopPicking();
   await removeMarkers(s);
   const count = await clearStoredPreview(s.doc);
-  s.groups = [];
-  s.joint = { routes: [], truncated: false };
-  s.activePreview = undefined;
-  s.previewBoard = undefined;
-  s.previewRegions = undefined;
-  s.previewKey = undefined;
+  discardResults(s);
   s.previewStale = false;
   s.previewLayer = null;
   s.restorePreview = false;
@@ -937,6 +1239,7 @@ async function newSession(quick) {
   stopPicking();
   const old = session;
   if (old) {
+    old.debugLog = undefined;
     await closeHint(old);
     await removeMarkers(old);
     if (old.restorePreview && old.doc.tabId === doc.tabId) await restorePreviewLayer(old);
@@ -946,13 +1249,15 @@ async function newSession(quick) {
     }
   }
   const s = {
-    doc, token: String(Date.now()) + Math.random(), pairs: [], groups: [], joint: { routes: [], truncated: false },
-    mode: 'separate', group: 0, selected: -1, colorMode: 'layer', display: 'follow', layerStyles: {},
+    doc, token: String(Date.now()) + Math.random(), pairs: [], groups: [], joint: null, page: 0,
+    mode: 'separate', group: 0, selected: -1, showAllRoutes: false, colorMode: 'layer', display: 'follow', layerStyles: {},
     curveDensity: DEFAULT_CURVE_DENSITY,
     workspaceWidth: DEFAULT_WORKSPACE_WIDTH,
     windowOpen: false, drawn: false, restorePreview: false, notice: '', markerWarning: '', boardThicknessMm: DEFAULT_BOARD_THICKNESS,
+    debugLog: { startedAt: new Date().toISOString(), lines: [], chars: 0, dropped: 0 },
   };
   session = s;
+  debugEvent(s, 'session.start', { version: EXTENSION_VERSION, scope: 'PCB', quick });
   await readView(s);
   if (!s.layers.length) throw new Error('当前 PCB 没有可分析的铜层。');
   await readStyles(s);
@@ -984,7 +1289,7 @@ function clearReturnPaths() {
   });
 }
 function cancelPicking() {
-  if (session?.hint) return requestCancel(session);
+  if (session?.hint || session?.progress) return requestCancel(session);
   return enqueue(async () => {
     stopPicking();
     if (!session) return;

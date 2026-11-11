@@ -252,7 +252,7 @@ function readAnchor(primitive, layerIds) {
   if (!id || !validPoint(p)) return null;
   if (type === 'Via') {
     if (![0, 2].includes(state(primitive, 'ViaType'))) return null;
-    return { id, p, layers: layerIds, radius: Number(state(primitive, 'Diameter') || 0) / 2 };
+    return { id, p, layers: layerIds, radius: Number(state(primitive, 'Diameter') || 0) / 2, via: true };
   }
   const layer = state(primitive, 'Layer');
   if (layer === MULTI_LAYER && !state(primitive, 'Metallization')) return null;
@@ -368,7 +368,7 @@ async function readEndpoint(hit, position, layerIds, visibleLayers = layerIds, d
   return { ...anchor, net, label };
 }
 
-async function readNet(net, layerIds, ends, density = DEFAULT_CURVE_DENSITY) {
+async function readNet(net, layerIds, ends, density = DEFAULT_CURVE_DENSITY, checkCancelled = () => {}, trace = () => {}) {
   const warnings = new Set();
   const [primitives, lines, arcs, vias, pads, pours, fills] = await Promise.all([
     eda.pcb_Net.getAllPrimitivesByNet(net).catch(() => undefined),
@@ -379,6 +379,9 @@ async function readNet(net, layerIds, ends, density = DEFAULT_CURVE_DENSITY) {
     eda.pcb_PrimitivePour.getAll(net),
     eda.pcb_PrimitiveFill.getAll(undefined, net),
   ]);
+  checkCancelled();
+  trace('pcb.primitives', { primitiveRecords: primitives?.length, lines: lines.length, arcs: arcs.length,
+    vias: vias.length, pads: pads.length, pours: pours.length, fills: fills.length, layerIds, density });
   const tracks = [...lines, ...arcs].filter(p => layerIds.includes(state(p, 'Layer')) && state(p, 'Net') === net)
     .map(primitive => readTrack(primitive, density));
   // Some desktop clients return raw models here, and filter by model object rather than primitive type.
@@ -386,16 +389,19 @@ async function readNet(net, layerIds, ends, density = DEFAULT_CURVE_DENSITY) {
   let parents = [...new Set((primitives || []).map(p => p.parentId).filter(id => typeof id === 'string' && id))];
   if (!Array.isArray(primitives)) {
     const components = await eda.pcb_PrimitiveComponent.getAll();
+    checkCancelled();
     parents = components.map(component => state(component, 'PrimitiveId')).filter(Boolean);
   }
   for (let i = 0; i < parents.length; i += 16) {
     const results = await Promise.allSettled(parents.slice(i, i + 16).map(id =>
       eda.pcb_PrimitiveComponent.getAllPinsByPrimitiveId(id)));
+    checkCancelled();
     for (const result of results) {
       if (result.status === 'fulfilled') pins.push(...(result.value || []));
       else warnings.add('部分封装焊盘读取失败，可能漏算相关路径。');
     }
   }
+  trace('pcb.component-pads', { componentCount: parents.length, records: pins.length });
   const anchors = new Map();
   for (const primitive of [...pads, ...pins, ...vias]) {
     if (state(primitive, 'Net') !== net) continue;
@@ -412,6 +418,8 @@ async function readNet(net, layerIds, ends, density = DEFAULT_CURVE_DENSITY) {
     .map(item => [item.globalIndex, item]));
   const loadedCopper = new Set();
   const poured = pours.length ? await eda.pcb_PrimitivePoured.getAll() : [];
+  checkCancelled();
+  trace('pcb.generated-pour', { generatedRecords: poured.length, nativeCopperRecords: copperById.size });
   const pouredByBorder = new Map();
   for (const item of poured) {
     const id = state(item, 'PourPrimitiveId'), list = pouredByBorder.get(id) || [];

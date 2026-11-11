@@ -10,7 +10,7 @@ const version = require('../extension.json').version;
 const code = 'const EXTENSION_VERSION = ' + JSON.stringify(version) + ';\n' + ['geometry.js', 'pcb.js', 'index.js'].map(name =>
   fs.readFileSync(path.join(dir, name), 'utf8')).join('\n');
 vm.runInContext(code, context);
-const api = vm.runInContext('({sealBoard, validateEnds, computeRoutes, combineRoutes, readPolygon, readBoard, readNet, readEndpoint, calculate, visibleLayer, readView, savePreview, clearStoredPreview, buildRoutePreview, copperLayers, readStyles, writeStyles, ringEdges, segmentIn, inCopper, readCopperDepths, validCopperDepths, estimateCopperDepths})', context);
+const api = vm.runInContext('({sealBoard, validateEnds, computeRoutes, routeSearch, combineRoutes, readPolygon, readBoard, readNet, readEndpoint, calculate, visibleLayer, readView, savePreview, clearStoredPreview, buildRoutePreview, copperLayers, readStyles, writeStyles, ringEdges, segmentIn, inCopper, readCopperDepths, validCopperDepths, estimateCopperDepths})', context);
 const readTrack = vm.runInContext('readTrack', context);
 const plain = value => JSON.parse(JSON.stringify(value));
 
@@ -21,12 +21,43 @@ const e = (id,x,y,layers=[1],net='GND') => ({id, p:p(x,y), net, layers, radius:0
 const t = (id,x,y,x2,y2,layer=1) => ({id,layer,points:[p(x,y),p(x2,y2)]});
 const m = (tracks,anchors,planes=[]) => ({tracks,anchors,planes,warnings:[]});
 
+function searchPasses(model, start, end, outline) {
+  const passes = new Map();
+  const search = api.routeSearch(model,start,end,outline,(event,data) => {
+    if (event==='solver.enumeration') passes.set(data.direction,data);
+  });
+  let step;
+  do { step=search.next(); } while (!step.done);
+  return { ...step.value, passes };
+}
+
+function routingForks(first, last, layer=1) {
+  const tracks=[];
+  for (let i=first; i<last; i++) {
+    const x=i*100;
+    tracks.push(t('direct-'+i,x,0,x+100,0,layer),
+      t('short-a-'+i,x,0,x+50,20,layer),t('short-b-'+i,x+50,20,x+100,0,layer));
+  }
+  return tracks;
+}
+
+test('bounds detailed diagnostic logs and reports discarded rows', () => {
+  const record = vm.runInContext('debugEvent', context);
+  const s = {debugLog:{lines:[],chars:0,dropped:0}};
+  for(let i=0;i<1400;i++) record(s,'test.entry',{ index:i });
+  assert.equal(s.debugLog.lines.length,1000);
+  assert.equal(s.debugLog.dropped,400);
+  for(let i=0;i<300;i++) record(s,'test.large',{ index:i, value:'中'.repeat(2500) });
+  assert.ok(s.debugLog.chars<=192*1024);
+  assert.ok(s.debugLog.dropped>400);
+  assert.match(s.debugLog.lines.at(-1),/299.*截断/);
+});
+
 test('ranks two ordinary branches by physical route length', () => {
   const a=e('a',0,0), b=e('b',80,0);
   const result = api.computeRoutes(m([t('straight',0,0,80,0),t('up',0,0,0,40),
     t('across',0,40,80,40),t('down',80,40,80,0)], [a,b]),a,b,board());
   assert.deepEqual(plain(result.routes.map(route => route.length)), [80, 160]);
-  assert.equal(result.truncated, false);
 });
 
 test('a copper arc keeps its physical length and uses denser preview segments', () => {
@@ -49,25 +80,6 @@ test('a copper arc keeps its physical length and uses denser preview segments', 
   const coarseTrack = readTrack(arc, 1);
   const recalculated = api.computeRoutes(m([coarseTrack], [b]), picked, b, board());
   assert.ok(recalculated.routes[0].length > 0 && recalculated.routes[0].length < routes[0].length);
-});
-
-test('similarity keeps the shortest representative and preserves distinct detours, layers and vias', () => {
-  const dedupe = vm.runInContext('shortestPerSimilarPath', context);
-  const trace = (points, layer=1) => ({kind:'track',layers:[layer],path:points,
-    length:points.slice(1).reduce((sum, b, i)=>sum+Math.hypot(b.x-points[i].x,b.y-points[i].y),0)});
-  const route = edges => ({edges,length:edges.reduce((sum, edge)=>sum+edge.length,0)});
-  const straight = route([trace([p(0,0),p(200,0)])]);
-  const near = route([trace([p(0,0),p(100,1.2),p(200,0)])]);
-  const detour = route([trace([p(0,0),p(100,20),p(200,0)])]);
-  const otherLayer = route([trace([p(0,0),p(100,1.2),p(200,0)],2)]);
-  const viaRoute = x => route([
-    trace([p(0,0),p(x,0)]), {kind:'via',layers:[1,2],path:[p(x,0)],length:5},
-    trace([p(x,0),p(200,0)],2),
-  ]);
-  const viaA = viaRoute(100), viaB = viaRoute(101);
-  assert.ok(near.length > straight.length);
-  const paths = [straight,near,otherLayer,viaA,viaB,detour].sort((a,b)=>a.length-b.length);
-  assert.deepEqual(Array.from(dedupe(paths)), paths.filter(path=>path!==near));
 });
 
 test('subdivides T junctions and accepts an endpoint on a trace centerline', () => {
@@ -162,12 +174,246 @@ test('rejects a geometrically short route that crosses a board slot', () => {
   assert.deepEqual(plain(result.routes.map(route => route.length)),[110]);
 });
 
-test('takes a detour around an actual clearance in filled copper', () => {
+test('keeps both equal-length corridors around a clearance in filled copper', () => {
   const a=e('a',10,50), b=e('b',90,50);
   const plane={id:'pour',layer:1,rings:[rect(0,0,100,100).slice(0,-1),rect(40,35,20,30).slice(0,-1).reverse()]};
   const result=api.computeRoutes(m([],[a,b],[plane]),a,b,board());
-  assert.equal(result.routes.length,1);
-  assert.ok(Math.abs(result.routes[0].length - (2 * Math.hypot(30,15) + 20)) < 1e-6);
+  assert.equal(result.routes.length,2);
+  assert.ok(result.routes.every(route => Math.abs(route.length - (2 * Math.hypot(30,15) + 20)) < 1e-6));
+  assert.deepEqual(Array.from(result.routes, route => route.edges[0].path[1].y).sort((a,b)=>a-b), [35,65]);
+});
+
+test('finds both sides of a board slot even when the stored copper ring covers it', () => {
+  const a=e('a',10,50), b=e('b',90,50);
+  const outline=api.sealBoard([rect(-10,-10,120,120)],[rect(40,35,20,30)]);
+  const ring=rect(0,0,100,100).slice(0,-1);
+  const net=m([],[a,b],[{id:'pour',layer:1,rings:[ring]}]);
+  for(const [start,end] of [[a,b],[b,a]]) {
+    const result=api.computeRoutes(net,start,end,outline);
+    assert.equal(result.incomplete,false);
+    assert.equal(result.routes.length,2);
+    const inside=api.validateEnds(start,end,outline);
+    const edges=[...outline.edges,...api.ringEdges(ring)];
+    assert.ok(result.routes.every(route=>route.edges.every(edge=>edge.path.slice(1).every((q,i)=>
+      api.segmentIn(edge.path[i],q,edges,inside)))));
+  }
+});
+
+test('collapses 4096 similar combinations before the maze and retains a distinct long detour', () => {
+  const a=e('a',0,0), b=e('b',1200,0);
+  const tracks=[];
+  for(let i=0;i<12;i++) {
+    const x=i*100;
+    tracks.push(t('direct-'+i,x,0,x+100,0),
+      t('near-a-'+i,x,0,x+50,0.5),t('near-b-'+i,x+50,0.5,x+100,0));
+  }
+  tracks.push(t('away-a',0,0,0,30),t('away-b',0,30,1200,30),t('away-c',1200,30,1200,0));
+  const outline=api.sealBoard([rect(-5,-5,1210,40)]);
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,outline);
+  assert.deepEqual(Array.from(result.routes,route=>route.length),[1200,1260]);
+  assert.equal(result.collapsedBranches,12);
+  assert.equal(result.limited,false);
+  assert.equal(result.incomplete,false);
+});
+
+test('clusters close stitching vias on both active pours, including across unused inner layers', () => {
+  const a=e('a',10,10), b=e('b',30,10,[2]);
+  const through=[1,15,16,2];
+  const vias=[e('nearest',15,10,through),e('near',20,11,through),e('nearer-than-far',23,12,through),
+    e('far',55,10,through)].map(via=>({...via,via:true}));
+  const planes=[1,2].map(layer=>({id:'pour-'+layer,layer,rings:[rect(0,0,80,80).slice(0,-1)]}));
+  const net={...m([],[a,b,...vias],planes),depthsMm:{1:0,15:0.1,16:0.2,2:0.3}};
+  const result=api.computeRoutes(net,a,b,board());
+  assert.equal(result.mergedVias,2);
+  assert.equal(result.routes.length,2);
+  assert.equal(result.limited,false);
+  assert.ok(Math.abs(result.routes[0].length-20-0.3/0.0254)<1e-8);
+  assert.deepEqual(Array.from(result.routes,route=>route.edges.find(edge=>edge.kind==='via').path[0].x),[15,55]);
+  assert.equal(api.computeRoutes(net,b,a,board()).mergedVias,2);
+});
+
+test('merges equivalent vias across all four copper faces with equal short detours', () => {
+  const through=[1,15,16,2];
+  const a=e('a',12,40), b=e('b',75,40,[2]);
+  const vias=[e('a-hole',32,40,through),e('b-hole',48,40,through)].map(via=>({...via,via:true}));
+  const planes=through.map(layer=>({id:'pour-'+layer,layer,rings:[
+    rect(0,0,85,80).slice(0,-1),rect(38,38,4,4).slice(0,-1).reverse(),
+  ]}));
+  const result=api.computeRoutes(m([],[a,b,...vias],planes),a,b,board());
+  assert.equal(result.mergedVias,1);
+  assert.ok(result.routes.length>=2);
+  assert.ok(result.routes.every(route=>route.edges.filter(edge=>edge.kind==='via').every(edge=>edge.path[0].x===32)));
+  const different=planes.map(plane=>plane.layer===15?{...plane,rings:[
+    plane.rings[0],rect(38,34,4,12).slice(0,-1).reverse(),
+  ]}:plane);
+  assert.equal(api.computeRoutes(m([],[a,b,...vias],different),a,b,board()).mergedVias,0);
+});
+
+test('keeps the shortest representative of similar complete routes through different junctions', () => {
+  const a=e('a',0,0), b=e('b',100,0);
+  const tracks=[t('a-low',0,0,50,0),t('b-low',50,0,100,0),
+    t('a-high',0,0,50,1),t('b-high',50,1,100,0),t('link',50,0,50,1)];
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,board());
+  assert.deepEqual(Array.from(result.routes,route=>route.length),[100]);
+  assert.ok(result.mergedRoutes>0);
+  assert.equal(result.limited,false);
+});
+
+test('deduplicates short jogs before a shared via without dropping a separate detour', () => {
+  const a=e('a',0,20), b=e('b',850,20,[2]), via=e('shared',750,20,[1,2]);
+  const tracks=[];
+  for(let i=0;i<6;i++) {
+    const x=i*125, y=20+(i+1)*0.13;
+    tracks.push(t('a-low-'+i,x,20,x+60,20),t('b-low-'+i,x+60,20,x+125,20),
+      t('a-high-'+i,x,20,x+60,y),t('b-high-'+i,x+60,y,x+125,20),t('cross-'+i,x+60,20,x+60,y));
+  }
+  tracks.push(t('finish',750,20,850,20,2),t('away-a',0,20,0,60),
+    t('away-b',0,60,750,60),t('away-c',750,60,750,20));
+  const outline=api.sealBoard([rect(-10,-10,870,100)]);
+  const result=api.computeRoutes(m(tracks,[a,b,via]),a,b,outline);
+  assert.deepEqual(Array.from(result.routes,route=>route.length),[850,930]);
+  assert.ok(result.mergedRoutes>=50);
+  assert.equal(result.limited,false);
+});
+
+test('preserves two near routes when an etched opening lies between them on the same copper layer', () => {
+  const a=e('a',10,50), b=e('b',90,50);
+  const plane={id:'pour',layer:1,rings:[
+    rect(0,0,100,100).slice(0,-1),rect(45,49.6,10,0.8).slice(0,-1).reverse(),
+  ]};
+  const result=api.computeRoutes(m([],[a,b],[plane]),a,b,board());
+  assert.equal(result.routes.length,2);
+  assert.deepEqual(Array.from(result.routes,route=>route.edges[0].path[1].y).sort((a,b)=>a-b),[49.6,50.4]);
+});
+
+test('preserves two near parallel routes when a cutout lies between them', () => {
+  const a=e('a',0,0), b=e('b',100,0);
+  const tracks=[-0.65,0.65].flatMap((y,i)=>[
+    t('start-'+i,0,0,10,y),t('middle-'+i,10,y,90,y),t('end-'+i,90,y,100,0),
+  ]);
+  const outline=api.sealBoard([rect(-5,-5,110,10)],[rect(48,-0.2,4,0.4)]);
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,outline);
+  assert.equal(result.routes.length,2);
+  assert.equal(result.collapsedBranches,0);
+  assert.equal(result.mergedRoutes,0);
+});
+
+test('collapses 12 pairs of stitching vias before searching the resulting 4096 combinations', () => {
+  const a=e('a',10,20), b=e('b',1210,20);
+  const outline=api.sealBoard([rect(-20,-5,1260,50)]);
+  const planes=Array.from({length:13},(_,i)=>({
+    id:'pour-'+i,layer:i%2+1,rings:[rect(i*100-10,0,120,40).slice(0,-1)],
+  }));
+  const vias=Array.from({length:12},(_,i)=>[96,104].map((x,j)=>
+    e('via-'+i+'-'+j,x+i*100,20+j,[1,2]))).flat();
+  const unclustered=api.computeRoutes(m([],[a,b,...vias],planes),a,b,outline);
+  const clustered=api.computeRoutes(m([],[a,b,...vias.map(via=>({...via,via:true}))],planes),a,b,outline);
+  assert.equal(unclustered.limited,false);
+  assert.equal(unclustered.routes.length,4096);
+  assert.equal(clustered.mergedVias,12);
+  assert.equal(clustered.routes.length,1);
+  assert.equal(clustered.routes[0].edges.filter(edge=>edge.kind==='via').length,12);
+  assert.equal(clustered.limited,false);
+});
+
+test('keeps nearby vias distinct across a slot, a copper split or different attachment layers', () => {
+  const a=e('a',10,10), b=e('b',45,10,[2]);
+  const vias=[e('left',26,10,[1,2,15]),e('right',36,10,[1,2,15])].map(via=>({...via,via:true}));
+  const top={id:'top',layer:1,rings:[rect(0,0,80,80).slice(0,-1)]};
+  const bottom={...top,id:'bottom',layer:2};
+  const cases=[
+    [top,{...bottom,rings:[...bottom.rings,rect(30,6,2,8).slice(0,-1).reverse()]}],
+    [top,{...bottom,rings:[rect(0,0,29,80).slice(0,-1),rect(33,0,47,80).slice(0,-1)]}],
+    [top,bottom,{id:'inner',layer:15,rings:[rect(20,2,10,15).slice(0,-1)],
+      },{id:'inner-contact',layer:15,rings:[rect(14,2,7,15).slice(0,-1)]}],
+  ];
+  for(const [index,planes] of cases.entries()) {
+    const anchors=index===2?[a,b,...vias,e('inner-pad',18,10,[15])]:[a,b,...vias];
+    const result=api.computeRoutes(m([],anchors,planes),a,b,board());
+    assert.equal(result.mergedVias,0);
+    assert.ok(result.routes.length);
+  }
+});
+
+test('retains every combination of visibly distinct routing branches in length order', () => {
+  const a=e('a',0,0), b=e('b',700,0);
+  const tracks=[];
+  for(let i=0;i<7;i++) {
+    const x=i*100;
+    tracks.push(t('direct-'+i,x,0,x+100,0),
+      t('branch-a-'+i,x,0,x+50,20),t('branch-b-'+i,x+50,20,x+100,0));
+  }
+  const outline=api.sealBoard([rect(-5,-5,710,30)]);
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,outline);
+  assert.equal(result.routes.length,128);
+  assert.ok(result.routes.every((route,i)=>i===0 || result.routes[i-1].length<=route.length));
+});
+
+test('probes an independent long branch among many shorter combinations', () => {
+  const a=e('a',0,0), b=e('b',1000,0);
+  const tracks=[];
+  for(let i=0;i<10;i++) {
+    const x=i*100;
+    tracks.push(t('direct-'+i,x,0,x+100,0),
+      t('branch-a-'+i,x,0,x+50,20),t('branch-b-'+i,x+50,20,x+100,0));
+  }
+  tracks.push(t('long-up',500,0,500,160),t('long-across',500,160,600,160),t('long-down',600,160,600,0));
+  const outline=api.sealBoard([rect(-5,-5,1010,175)]);
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,outline);
+  assert.ok(result.routes.length>1);
+  assert.ok(result.routes.some(route=>route.length===1320));
+});
+
+test('probes different departure directions and layers before the search reaches its budget', () => {
+  const a=e('a',0,0,[1,2]), b=e('b',5000,0,[1,2]);
+  const tracks=[];
+  for(let i=0;i<50;i++) {
+    const x=i*100;
+    tracks.push(t('direct-'+i,x,0,x+100,0),
+      t('upper-a-'+i,x,0,x+50,20),t('upper-b-'+i,x+50,20,x+100,0));
+  }
+  const detour=(id,layer,y)=>[t(id+'-start',0,0,0,y,layer),
+    t(id+'-across',0,y,5000,y,layer),t(id+'-end',5000,y,5000,0,layer)];
+  tracks.push(...detour('north',1,200),...detour('south',1,-400),...detour('bottom',2,-100));
+  const outline=api.sealBoard([rect(-10,-420,5020,640)]);
+  const result=api.computeRoutes(m(tracks,[a,b]),a,b,outline);
+  assert.ok(result.limited);
+  for (const [length,layer] of [[5400,1],[5800,1],[5200,2]]) {
+    assert.ok(result.routes.some(route=>route.length===length && route.edges.every(edge=>edge.layers[0]===layer)),
+      `missing ${length} mil detour on layer ${layer}`);
+  }
+});
+
+test('reverse search adds a route leaving the target and keeps its geometry in A-to-B order', () => {
+  const a=e('a',0,0), b=e('b',5000,0);
+  const tracks=routingForks(0,50);
+  tracks.push(t('long-out',200,0,200,-400),t('long-across',200,-400,5000,-400),
+    t('long-in',5000,-400,5000,0));
+  const outline=api.sealBoard([rect(-10,-420,5020,460)]);
+  const { routes, passes }=searchPasses(m(tracks,[a,b]),a,b,outline);
+  assert.deepEqual([...passes.keys()],['forward','reverse','same-layer']);
+  assert.ok(passes.get('reverse').startSolutions>0);
+  assert.ok(passes.get('reverse').duplicates>0);
+  const detour=routes.find(route=>route.length===5800);
+  assert.ok(detour?.edges.some(edge=>edge.path.some(p=>p.y===-400)));
+  assert.deepEqual(plain(detour.edges[0].path[0]),a.p);
+  assert.deepEqual(plain(detour.edges.at(-1).path.at(-1)),b.p);
+});
+
+test('same-layer search adds the long top-layer route among shorter options through vias', () => {
+  const a=e('a',0,0), b=e('b',5000,0);
+  const tracks=routingForks(1,49,2);
+  tracks.push(t('lead',0,0,300,0),t('long-out',300,0,300,-800),
+    t('long-across',300,-800,4700,-800),t('long-in',4700,-800,4700,0),t('tail',4700,0,5000,0));
+  const vias=[100,200,4800,4900].map(x=>e('via-'+x,x,0,[1,2]));
+  const outline=api.sealBoard([rect(-10,-820,5020,860)]);
+  const model={...m(tracks,[a,b,...vias]),depthsMm:{1:0,2:1.6}};
+  const { routes, passes }=searchPasses(model,a,b,outline);
+  assert.equal(passes.get('same-layer').added,1);
+  assert.ok(routes[0].edges.some(edge=>edge.kind==='via'));
+  const planar=routes.filter(route=>route.edges.every(edge=>edge.kind!=='via'));
+  assert.deepEqual(Array.from(planar,route=>route.length),[6600]);
+  assert.ok(planar[0].edges.every(edge=>edge.layers[0]===1));
 });
 
 test('does not join two disconnected fills with the same name', () => {
@@ -191,21 +437,24 @@ test('reads desktop board outline coordinates without flipping Y', () => {
   assert.equal(outline.island(p(40,40)),-1);
 });
 
-test('reports a partial candidate list when limited', () => {
+test('does not include a closed side loop returning to an already visited junction', () => {
   const a=e('a',0,0), b=e('b',80,0);
-  const result=api.computeRoutes(m([t('straight',0,0,80,0),t('up',0,0,0,40),
-    t('across',0,40,80,40),t('down',80,40,80,0)], [a,b]),a,b,board(),1);
-  assert.equal(result.truncated,true);
-  assert.equal(result.routes[0].length,80);
+  const result=api.computeRoutes(m([t('left',0,0,40,0),t('right',40,0,80,0),t('up',40,0,40,20),
+    t('over',40,20,55,20),t('back',55,20,40,0)], [a,b]),a,b,board());
+  assert.deepEqual(Array.from(result.routes, route=>route.length),[80]);
 });
 
 test('combines explicit A and B pairs in nondecreasing total length', () => {
   const routes=lengths=>lengths.map(length=>({length,edges:[]}));
-  const result=api.combineRoutes([{label:'A→A',routes:routes([10,15,25])},{label:'B→B',routes:routes([2,9])}],5);
-  assert.deepEqual(plain(result.routes.map(route=>route.length)),[12,17,19,24,27]);
-  assert.equal(result.truncated,true);
-  assert.deepEqual(plain(result.routes[0].parts.map(item=>item.label)),['A→A','B→B']);
-  assert.equal(api.combineRoutes([{routes:[]}]).routes.length,0);
+  const result=[...api.combineRoutes([{label:'A→A',routes:routes([10,15,25])},{label:'B→B',routes:routes([2,9])}])];
+  assert.deepEqual(plain(result.map(route=>route.length)),[12,17,19,24,27,34]);
+  assert.deepEqual(plain(result[0].parts.map(item=>item.label)),['A→A','B→B']);
+  assert.equal([...api.combineRoutes([{routes:[]}])].length,0);
+  const list=routes(Array.from({length:9},(_,i)=>i));
+  const combinations=[...api.combineRoutes([{routes:list},{routes:list},{routes:list}])];
+  assert.equal(combinations.length,729);
+  assert.equal(new Set(combinations.map(route=>route.parts.map(part=>part.index).join(','))).size,729);
+  assert.ok(combinations.every((route,i)=>i===0 || route.length>=combinations[i-1].length));
 });
 
 test('single-layer preview never shows segments belonging only to other layers', () => {
@@ -516,10 +765,10 @@ test('uses raw net-query parent IDs to read normalized component pads', async ()
 
 test('menu flow picks a plated multilayer connector pad and via, logs results, and clears the preview', async () => {
   const doc={documentType:3,uuid:'integration-fixture',tabId:'one',parentProjectUuid:'proj'};
-  let selected, custom, results, panel, receive, cancelOnStage, reportPreviewAlias=false;
-  let markerSupported=true, markers=[], markerWidth;
-  const events=[], logs=[], storage=new Map(), drawn=new Map(), openWindows=new Map();
-  let viewportWidth=1440, previewSerial=0;
+  let selected, custom, results, panel, receive, cancelOnStage, cancelledSearch, cancelledSession, reportPreviewAlias=false;
+  let markerSupported=true, markers=[], markerWidth, markerWidths=[];
+  const events=[], logs=[], exportedLogs=[], storage=new Map(), drawn=new Map(), openWindows=new Map();
+  let viewportWidth=1440, previewSerial=0, includeAlternatives=false, netReads=0;
   const a={primitiveType:'ComponentPad',primitiveId:'a',net:'GND',x:10,y:-10,layer:12,
     metallization:true,padNumber:'1',pad:['RECT',4,4]};
   const b={primitiveType:'Via',primitiveId:'b',net:'GND',x:70,y:-10,viaType:0,diameter:4};
@@ -529,6 +778,13 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
     {...wire,primitiveId:'lower-a',layer:2,endX:40,endY:-9.8},
     {...wire,primitiveId:'lower-b',layer:2,startX:40,startY:-9.8},
   ];
+  const alternatives=Array.from({length:6},(_,i)=>{
+    const x=10+i*10;
+    return [
+      {...wire,primitiveId:'detour-a-'+i,startX:x,endX:x+5,endY:-8},
+      {...wire,primitiveId:'detour-b-'+i,startX:x+5,startY:-8,endX:x+10},
+    ];
+  }).flat();
   const markerLayer={id:71,name:'',type:'CUSTOM',layerStatus:1};
   const eda={
     dmt_SelectControl:{getCurrentDocumentInfo:async()=>doc},
@@ -537,9 +793,10 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
         if (!markerSupported) return false;
         markers.push(...list);
         markerWidth=width;
+        markerWidths.push(width);
         return true;
       },
-      removeIndicatorMarkers:async()=>{markers=[];return true;},
+      removeIndicatorMarkers:async()=>{markers=[];markerWidths=[];return true;},
     },
     pcb_Layer:{
       getAllLayers:async()=>[{id:1,name:'Top',type:'SIGNAL',layerStatus:1,color:'#FF4040'},
@@ -555,7 +812,11 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
     pcb_Event:{isEventListenerAlreadyExist:()=>Boolean(selected),removeEventListener:()=>{selected=null;return true;},
       addMouseEventListener:(_,type,fn)=>{assert.equal(type,'selected');selected=fn;}},
     pcb_Net:{getAllPrimitivesByNet:async()=>[]},
-    pcb_PrimitiveLine:{getAll:async net=>net==='GND'?[...lowerBranch,wire]:[]},
+    pcb_PrimitiveLine:{getAll:async net=>{
+      if(net!=='GND') return [];
+      netReads++;
+      return [...lowerBranch,wire,...(includeAlternatives?alternatives:[])];
+    }},
     pcb_PrimitiveArc:{getAll:async()=>[]},pcb_PrimitiveVia:{getAll:async()=>[b],get:async id=>id==='c'?rejected:b},
     pcb_MathPolygon:{createPolygon:source=>({getSource:()=>source})},
     pcb_PrimitivePolyline:{
@@ -580,10 +841,14 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
     sys_MessageBus:{subscribe:(_,callback)=>{receive=callback;},publish:(topic,data)=>{
       const payload=JSON.parse(data);
       if (topic.endsWith('.state')) results=payload;
+      else if (topic.endsWith('.debugLog')) exportedLogs.push(payload);
       else {
         events.push(payload.text);
         if (cancelOnStage && payload.text.includes(cancelOnStage)) {
           cancelOnStage=undefined;
+          cancelledSession=instance.menu.currentSession();
+          cancelledSearch=cancelledSession.activeSearch;
+          receive(JSON.stringify({type:'exportLog',token:payload.token}));
           receive(JSON.stringify({type:'cancel',token:payload.token}));
         }
       }
@@ -605,7 +870,7 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
     sys_PanelControl:{openBottomPanel:tab=>{panel=tab;}},
   };
   const wrapped = 'var menu=(() => { if (eda.testRuntime) return eda.testRuntime;\n' + code +
-    '\nreturn (eda.testRuntime={checkReturnPath,clearReturnPaths,showRunLog,drain:()=>queue});})();';
+    '\nreturn (eda.testRuntime={checkReturnPath,clearReturnPaths,showRunLog,drain:()=>queue,currentSession:()=>session});})();';
   const instance=vm.createContext({eda,setTimeout:(fn, delay)=>delay === 32 ? queueMicrotask(fn) : 0, clearTimeout:()=>{}});
   vm.runInContext(wrapped,instance);
   await instance.menu.showRunLog();
@@ -625,19 +890,39 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
   assert.ok(events.some(text=>text.includes('请单击流入点')));
   selected('selected',[{primitiveType:'Via',primitiveId:'b',net:'GND'}]);
   await instance.menu.drain();
-  assert.deepEqual(results.groups[0].routes.map(route=>route.length),[60]);
+  assert.equal(results.groups[0].routes.length,2);
+  assert.equal(results.groups[0].routes[0].length,60);
+  assert.ok(results.groups[0].routes[1].edges.every(edge=>edge.layers[0]===2));
   assert.deepEqual(results.groups[0].start.layers,[1,2]);
   assert.deepEqual(results.groups[0].end.layers,[1,2]);
   assert.ok(logs.some(entry=>entry.message.includes('J1.1') && entry.message.includes('Top / Bottom')));
-  assert.ok(logs.some(entry=>entry.message.includes('最短 1.524 mm')));
+  assert.ok(logs.some(entry=>entry.message.includes('可行解 · 长度 1.524 mm')));
   assert.ok(logs.every(entry=>entry.message.startsWith('[回流路径] ')));
   assert.equal(results.previewLayer,71);
   assert.equal(openWindows.get('return-path-results').title,'回流路径检查 v'+version);
+  assert.equal(openWindows.get('return-path-results').minimizeButton,true);
+  assert.equal(openWindows.get('return-path-results').minimizeStyle,'collapsed');
   assert.equal(drawn.size,1);
   assert.equal(markers.length,1);
   assert.equal(markerWidth,8);
   assert.equal([...drawn.values()][0].width,8);
   assert.ok(!openWindows.has('return-path-task-hint'));
+  const updateView=async fields=>{
+    receive(JSON.stringify({type:'view',token:results.token,...fields}));
+    await instance.menu.drain();
+  };
+  await updateView({showAllRoutes:true});
+  assert.equal(results.showAllRoutes,true);
+  assert.equal(results.inactivePreview.paths[0].layer,2);
+  assert.equal(results.inactivePreview.paths[0].routeIndex,1);
+  assert.deepEqual(markerWidths,[0.8,8]);
+  assert.deepEqual([...drawn.values()].map(item=>item.width),[0.8,8]);
+  await updateView({selected:1});
+  assert.equal(results.activePreview.paths[0].layer,2);
+  assert.equal(results.inactivePreview.paths[0].layer,1);
+  await updateView({showAllRoutes:false,selected:0});
+  assert.equal(results.inactivePreview,undefined);
+  assert.equal(drawn.size,1);
   const recalculate=async()=>{
     receive(JSON.stringify({type:'calculate',token:results.token,mode:'separate',mapping:[0]}));
     await instance.menu.drain();
@@ -685,6 +970,32 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
   await recalculate();
   assert.ok(logs.some(entry=>entry.message.includes('首次板框校验失败') && entry.message.includes('无法按图元 ID 读取板框折线')));
   assert.ok(logs.some(entry=>entry.message.includes('已清除 1 条旧预览线，正在重新读取板框')));
+  reportPreviewAlias=false;
+  includeAlternatives=true;
+  await recalculate();
+  assert.equal(results.routePage.count,'65');
+  assert.equal(results.groups[0].routes.length,50);
+  const reads=netReads;
+  await updateView({showAllRoutes:true});
+  assert.ok(results.inactivePreview.paths.some(path=>path.routeIndex===64));
+  await updateView({diagramRoute:64,previewRequest:17});
+  assert.equal(results.previewRequest,17);
+  assert.equal(results.routePage.offset,50);
+  assert.equal(results.routePage.hasNext,false);
+  assert.equal(results.groups[0].routes.length,15);
+  assert.equal(results.selected,64);
+  assert.ok(results.activePreview.paths[0].points.some(point=>point.y>-9));
+  assert.equal(netReads,reads);
+  await updateView({page:0,showAllRoutes:false});
+  assert.equal(results.selected,0);
+  receive(JSON.stringify({type:'calculate',token:results.token,mode:'joint',mapping:[0]}));
+  await instance.menu.drain();
+  assert.equal(results.routePage.count,'65');
+  assert.equal(results.joint.routes.length,50);
+  await updateView({page:1});
+  assert.equal(results.joint.routes.length,15);
+  assert.equal(results.joint.routes.at(-1).parts[0].index,65);
+  assert.equal(results.groups[0].routes.length,0);
   const initial=instance.menu;
   vm.runInContext(wrapped,instance);
   assert.equal(initial,instance.menu);
@@ -693,6 +1004,20 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
   assert.equal(markers.length,0);
   assert.equal(results.groups.length,0);
   assert.ok(logs.some(entry=>entry.message.includes('已清除 1 条预览线')));
+  const firstSession=instance.menu.currentSession();
+  receive(JSON.stringify({type:'exportLog',token:results.token}));
+  const diagnostic=exportedLogs.at(-1);
+  assert.match(diagnostic.filename,/\.log$/);
+  for(const tag of ['session.start','selection.endpoint','analysis.board','analysis.stackup','pcb.primitives',
+    'analysis.model','solver.graph','solver.enumeration','preview.render','ui.action','log.export']) {
+    assert.ok(diagnostic.text.includes(tag),tag);
+  }
+  assert.match(diagnostic.text,/solver\.enumeration.*"algorithm":"weighted-maze".*"frontierPeak":/);
+  await eda.sys_IFrame.closeIFrame('return-path-results');
+  await instance.menu.drain();
+  assert.equal(firstSession.debugLog,undefined);
+  receive(JSON.stringify({type:'exportLog',token:results.token}));
+  assert.equal(exportedLogs.length,1);
   viewportWidth=620;
   await instance.menu.checkReturnPath();
   const narrowHint=openWindows.get('return-path-task-hint');
@@ -700,13 +1025,24 @@ test('menu flow picks a plated multilayer connector pad and via, logs results, a
   assert.equal(narrowHint.x,16);
   selected('selected',[{primitiveType:'Component',primitiveId:'J1-id',designator:'J1'}]);
   await instance.menu.drain();
-  cancelOnStage='读取同网络铜箔';
+  cancelOnStage='搜索连通路径';
   selected('selected',[{primitiveType:'Via',primitiveId:'b',net:'GND'}]);
   await instance.menu.drain();
   await instance.menu.drain();
   assert.equal(drawn.size,0);
   assert.equal(openWindows.size,0);
   assert.equal(selected,null);
+  assert.ok(cancelledSearch);
+  assert.equal(cancelledSearch.next().done,true);
+  assert.equal(cancelledSession.activeSearch,undefined);
+  assert.equal(cancelledSession.groups.length,0);
+  assert.equal(cancelledSession.previewBoard,undefined);
+  assert.equal(cancelledSession.routePreviews,undefined);
+  assert.equal(cancelledSession.debugLog,undefined);
+  assert.equal(exportedLogs.length,2);
+  assert.match(exportedLogs[1].text,/log\.export.*"calculating":true/);
+  assert.doesNotMatch(exportedLogs[1].text,/preview\.render/);
+  assert.equal(instance.menu.currentSession(),null);
   assert.ok(logs.some(entry=>entry.message.includes('已取消回流路径检查')));
 });
 

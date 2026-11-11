@@ -1,5 +1,20 @@
 const EPS = 1e-7;
 const SNAP = 0.02; // mil
+const VIA_CLUSTER_MM = 0.5;
+const VIA_DISTANCE_TOLERANCE = 0.025 / 0.0254;
+const ROUTE_SIMILARITY_MIL = 4;
+const SEARCH_STEP_BUDGET = 500000;
+const SIMILARITY_WORK_BUDGET = 2000000;
+const MAZE_STATE_LIMIT = 32000;
+const START_PROBE_LIMIT = 32;
+const START_PROBE_TOTAL_STEPS = 24000;
+const BRANCH_PROBE_LIMIT = 48;
+const BRANCH_PROBE_STEPS = 4096;
+const BRANCH_PROBE_TOTAL_STEPS = 65000;
+const SEARCH_TIME_MS = 2500;
+const VIA_CLUSTER_WORK_LIMIT = 2000000;
+const GRAPH_NODE_LIMIT = 120000;
+const GRAPH_EDGE_LIMIT = 240000;
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const at = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
 const cross = (ax, ay, bx, by) => ax * by - ay * bx;
@@ -176,13 +191,16 @@ function arcPoints(a, b, degrees, subdivisions = 1) {
 class MinHeap {
   items = [];
   get size() { return this.items.length; }
-  push(value, rank) {
-    const list = this.items, entry = { value, rank };
+  static precedes(a, b) {
+    return a.rank < b.rank || (a.rank === b.rank && a.tie < b.tie);
+  }
+  push(value, rank, tie = 0) {
+    const list = this.items, entry = { value, rank, tie };
     let i = list.length;
     list.push(entry);
     while (i > 0) {
       const parent = (i - 1) >> 1;
-      if (list[parent].rank <= rank) break;
+      if (!MinHeap.precedes(entry, list[parent])) break;
       list[i] = list[parent];
       i = parent;
     }
@@ -194,8 +212,8 @@ class MinHeap {
       let i = 0;
       while (2 * i + 1 < list.length) {
         let child = 2 * i + 1;
-        if (child + 1 < list.length && list[child + 1].rank < list[child].rank) child++;
-        if (list[child].rank >= last.rank) break;
+        if (child + 1 < list.length && MinHeap.precedes(list[child + 1], list[child])) child++;
+        if (!MinHeap.precedes(list[child], last)) break;
         list[i] = list[child];
         i = child;
       }
@@ -217,132 +235,676 @@ class RouteGraph {
     return this.keys.get(key);
   }
   addNode(p, layer) {
+    if (this.nodes.length >= GRAPH_NODE_LIMIT) throw new Error('同网连接图达到节点容量上限，已停止建模。');
     return this.nodes.push({ p, layer, edges: [] }) - 1;
   }
-  connect(a, b, length, kind, path, layers, plane = '', radius = 0) {
+  connect(a, b, length, kind, path, layers, plane = '', radius = 0, portal) {
     if (a === b) return;
     const key = [Math.min(a, b), Math.max(a, b), kind, plane].join('|');
     if (this.edgeKeys.has(key)) return;
+    if (this.edgeKeys.size >= GRAPH_EDGE_LIMIT) throw new Error('同网连接图达到连线容量上限，已停止建模。');
     this.edgeKeys.add(key);
-    this.nodes[a].edges.push({ to: b, length, kind, path, layers, plane, radius });
-    this.nodes[b].edges.push({ to: a, length, kind, path: path.slice().reverse(), layers: layers.slice().reverse(), plane, radius });
+    const id = this.edgeKeys.size * 2;
+    this.nodes[a].edges.push({ id, to: b, length, kind, path, layers, plane, radius, portal });
+    this.nodes[b].edges.push({ id: id + 1, to: a, length, kind, path: path.slice().reverse(),
+      layers: layers.slice().reverse(), plane, radius, portal: portal?.slice().reverse() });
   }
 }
 
-function* shortestDistances(graph, start) {
-  const distances = new Float64Array(graph.nodes.length).fill(Infinity);
-  distances[start] = 0;
-  const queue = new MinHeap();
-  queue.push(start, 0);
-  let visited = 0;
-  while (queue.size) {
-    if (++visited % 512 === 0) yield '枚举并排序候选路径';
-    const { value: id, rank: cost } = queue.pop();
-    if (cost > distances[id]) continue;
-    for (const edge of graph.nodes[id].edges) {
-      const next = cost + edge.length;
-      if (next >= distances[edge.to]) continue;
-      distances[edge.to] = next;
-      queue.push(edge.to, next);
+function localCopperDistance(a, b, region, inside, maxDistance, reserve) {
+  const boundary = region.boundary;
+  const contains = p => inside(p) && region.contains(p);
+  if (!reserve(boundary.length)) return Infinity;
+  if (segmentIn(a, b, boundary, contains)) return distance(a, b);
+
+  // An admissible short detour can only bend at vertices inside this ellipse.
+  const points = [a, b];
+  const keys = new Set(points.map(p => keyOf(p, '')));
+  if (!reserve(boundary.length)) return Infinity;
+  for (const edge of boundary) {
+    for (const p of edge) {
+      if (distance(a, p) + distance(p, b) > maxDistance + EPS || !contains(p)) continue;
+      const key = keyOf(p, '');
+      if (keys.has(key)) continue;
+      if (points.length >= 32) return Infinity;
+      keys.add(key);
+      points.push(p);
     }
   }
-  return distances;
-}
-
-function* enumerateRoutes(graph, start, end, maxRoutes = 100, finishRoute) {
-  const remaining = yield* shortestDistances(graph, end);
-  if (!Number.isFinite(remaining[start])) return { routes: [], truncated: false };
-  const queue = new MinHeap();
-  const routes = [];
-  let deadline = Date.now() + 1300;
-  const endpointVias = [start, end].filter(id => graph.nodes[id].edges.length > 1)
-    .map(id => graph.nodes[id].p);
-  queue.push({ id: start, cost: 0, via: null, prev: null }, remaining[start]);
-  let expanded = 0;
-  while (queue.size) {
-    if (++expanded > 60000 || Date.now() > deadline || queue.size > 60000) return { routes, truncated: true };
-    if (expanded % 128 === 0) {
-      const pause = Date.now();
-      yield '枚举并排序候选路径';
-      deadline += Date.now() - pause;
-    }
-    const { value: state } = queue.pop();
-    if (state.id === end) {
-      if (routes.length === maxRoutes) return { routes, truncated: true };
-      const edges = [];
-      for (let item = state; item.via; item = item.prev) {
-        if (item.via.kind !== 'endpoint') edges.push(item.via);
+  const lengths = new Float64Array(points.length).fill(Infinity);
+  const closed = new Uint8Array(points.length);
+  lengths[0] = 0;
+  while (true) {
+    let from = -1, best = Infinity;
+    for (let i = 0; i < lengths.length; i++) {
+      if (!closed[i] && lengths[i] < best) {
+        from = i;
+        best = lengths[i];
       }
-      edges.reverse();
-      const route = finishRoute ? finishRoute(edges) : { length: state.cost, edges };
-      if (route) routes.push(route);
+    }
+    if (from < 0 || from === 1) return best;
+    closed[from] = 1;
+    for (let to = 1; to < points.length; to++) {
+      if (closed[to]) continue;
+      const next = best + distance(points[from], points[to]);
+      if (next >= lengths[to] || next + distance(points[to], b) > maxDistance + EPS) continue;
+      if (!reserve(boundary.length)) return Infinity;
+      if (segmentIn(points[from], points[to], boundary, contains)) lengths[to] = next;
+    }
+  }
+}
+
+function* suppressNearbyVias(graph, anchors, terminals, meshPlanes, board, inside) {
+  const suppressed = new Set();
+  if (!meshPlanes.size) return { suppressed, count: 0 };
+  const viaCount = anchors.filter(anchor => anchor.via).length;
+  if (viaCount < 2) return { suppressed, count: 0 };
+  yield '检查同铜区相邻过孔';
+  const { nodes, keys } = graph;
+  const protectedCenters = new Set([...terminals, ...anchors.filter(anchor => !anchor.via)]
+    .map(anchor => keyOf(anchor.p, '')));
+  const viaCenters = new Set();
+  for (const anchor of anchors) {
+    if (!anchor.via) continue;
+    const key = keyOf(anchor.p, '');
+    if (viaCenters.has(key)) protectedCenters.add(key);
+    viaCenters.add(key);
+  }
+  const parent = Int32Array.from(nodes, (_, id) => id);
+  const root = id => {
+    while (parent[id] !== id) {
+      parent[id] = parent[parent[id]];
+      id = parent[id];
+    }
+    return id;
+  };
+  for (let id = 0; id < nodes.length; id++) {
+    if (id % 512 === 0) yield '检查同铜区相邻过孔';
+    for (const edge of nodes[id].edges) {
+      if (id < edge.to && edge.kind === 'mesh') parent[root(edge.to)] = root(id);
+    }
+  }
+  const candidates = [];
+  for (const [index, anchor] of anchors.entries()) {
+    if (index % 128 === 0) yield '检查同铜区相邻过孔';
+    if (!anchor.via || protectedCenters.has(keyOf(anchor.p, '')) ||
+        terminals.some(terminal => distance(terminal.p, anchor.p) <= SNAP)) continue;
+    const barrel = [], contacts = [];
+    for (const layer of anchor.layers) {
+      const id = keys.get(keyOf(anchor.p, layer));
+      if (id == null) continue;
+      const edges = nodes[id].edges;
+      for (const edge of edges) if (edge.kind === 'via') barrel.push(edge.id);
+      if (!edges.some(edge => edge.kind !== 'via')) continue;
+      const planes = new Set(edges.filter(edge => edge.kind === 'mesh').map(edge => edge.plane));
+      contacts.push({ layer, component: root(id), planes });
+    }
+    // A transition is interchangeable only if each of its usable copper
+    // layers has a shared local pour. Ignore unused inner barrel layers.
+    if (contacts.length < 2 || contacts.some(contact => !contact.planes.size)) continue;
+    contacts.sort((a, b) => a.layer - b.layer);
+    const from = distance(anchor.p, terminals[0].p);
+    candidates.push({ p: anchor.p, barrel, contacts, from,
+      score: from + distance(anchor.p, terminals[1].p),
+      signature: contacts.map(({ layer, component }) => layer + ':' + component).join('|') });
+  }
+  candidates.sort((a, b) => a.score - b.score || a.from - b.from);
+  const reach = VIA_CLUSTER_MM / 0.0254;
+  const cells = new Map();
+  let checks = 0, count = 0, work = 0;
+  const reserve = steps => (work += steps) <= VIA_CLUSTER_WORK_LIMIT;
+  candidateLoop: for (const candidate of candidates) {
+    const { p, signature } = candidate;
+    const x = Math.floor(p.x / reach), y = Math.floor(p.y / reach);
+    const cellKey = (a, b) => signature + ':' + a + ':' + b;
+    let matched = false;
+    for (let dx = -1; dx <= 1 && !matched; dx++) {
+      for (let dy = -1; dy <= 1 && !matched; dy++) {
+        for (const keep of cells.get(cellKey(x + dx, y + dy)) || []) {
+          if (++checks % 128 === 0) yield '检查同铜区相邻过孔';
+          if (!reserve(1)) break candidateLoop;
+          const gap = distance(p, keep.p);
+          if (gap > reach) continue;
+          if (!reserve(board.edges.length)) break candidateLoop;
+          if (!segmentIn(p, keep.p, board.edges, inside)) continue;
+          let shortest = Infinity, longest = 0;
+          for (const [i, { planes }] of candidate.contacts.entries()) {
+            let length = Infinity;
+            for (const id of planes) {
+              if (!keep.contacts[i].planes.has(id)) continue;
+              const region = meshPlanes.get(id);
+              length = Math.min(length, localCopperDistance(p, keep.p, region, inside, gap * 1.5, reserve));
+              if (length <= gap + EPS) break;
+            }
+            shortest = Math.min(shortest, length);
+            longest = Math.max(longest, length);
+            if (!Number.isFinite(length) || longest - shortest > VIA_DISTANCE_TOLERANCE) break;
+          }
+          matched = Number.isFinite(longest) && longest - shortest <= VIA_DISTANCE_TOLERANCE;
+          if (matched) break;
+        }
+      }
+    }
+    if (matched) {
+      for (const id of candidate.barrel) suppressed.add(id);
+      count++;
+    } else {
+      const key = cellKey(x, y);
+      if (!cells.has(key)) cells.set(key, []);
+      cells.get(key).push(candidate);
+    }
+  }
+  return { suppressed, count, limited: work > VIA_CLUSTER_WORK_LIMIT };
+}
+
+function routeShape(edges) {
+  const runs = [];
+  let run, length = 0;
+  for (const edge of edges) {
+    if (edge.kind === 'via') {
+      run = undefined;
       continue;
     }
-    const visited = new Set();
-    for (let item = state; item; item = item.prev) visited.add(item.id);
-    for (const edge of graph.nodes[state.id].edges) {
-      if (visited.has(edge.to) || !Number.isFinite(remaining[edge.to])) continue;
-      if (edge.kind === 'plane' && edge.plane && edge.plane === state.via?.plane && state.via.kind === 'plane') continue;
-      if (edge.kind === 'via' && endpointVias.some(p => distance(p, edge.path[0]) <= SNAP)) continue;
-      const cost = state.cost + edge.length;
-      queue.push({ id: edge.to, cost, via: edge, prev: state }, cost + remaining[edge.to]);
+    for (let i = 1; i < edge.path.length; i++) {
+      const a = edge.path[i - 1], b = edge.path[i], span = distance(a, b);
+      if (span <= EPS) continue;
+      const layer = edge.layers[0];
+      if (run?.layer !== layer) {
+        run = { layer, spans: [], length: 0 };
+        runs.push(run);
+      }
+      const previous = run.spans.at(-1);
+      if (previous && previous.plane === edge.plane && distance(previous.b, a) <= EPS &&
+          Math.abs(cross(a.x - previous.a.x, a.y - previous.a.y, b.x - a.x, b.y - a.y)) <= EPS &&
+          (a.x - previous.a.x) * (b.x - a.x) + (a.y - previous.a.y) * (b.y - a.y) > 0) {
+        previous.b = b;
+        previous.end += span;
+      } else {
+        run.spans.push({ a, b, start: run.length, end: run.length + span, plane: edge.plane });
+      }
+      run.length += span;
+      length += span;
     }
   }
-  return { routes, truncated: false };
+  return { length, runs };
 }
 
-function routeWithinPlane(graph, plane, board, insideBoard, ports) {
-  if (ports.size < 2) return true;
-  const vertices = [...ports.values()], idSet = new Set([...ports.keys()]);
-  const seen = new Set(vertices.map(p => keyOf(p, plane.layer)));
-  for (const p of plane.rings.flat()) {
-    const key = keyOf(p, plane.layer);
-    if (seen.has(key) || !insideBoard(p)) continue;
-    seen.add(key);
-    vertices.push(p);
+function inTriangle(p, a, b, c) {
+  const turn = (u, v) => cross(v.x - u.x, v.y - u.y, p.x - u.x, p.y - u.y);
+  const ab = turn(a, b), bc = turn(b, c), ca = turn(c, a);
+  return (ab > EPS && bc > EPS && ca > EPS) || (ab < -EPS && bc < -EPS && ca < -EPS);
+}
+
+function sameRouteStrip(p, q, nextP, nextQ, planes, context) {
+  const { board, inside, meshPlanes, reserve } = context;
+  const perimeter = [[p, q], [q, nextQ], [nextQ, nextP], [nextP, p]];
+  const box = boundsOf(perimeter);
+  const inStrip = v => inTriangle(v, p, q, nextQ) || inTriangle(v, p, nextQ, nextP);
+  const nearStrip = edge => minX(edge) <= box.right + EPS && maxX(edge) >= box.left - EPS &&
+    minY(edge) <= box.top + EPS && maxY(edge) >= box.bottom - EPS;
+  const boardEdges = board.edges.filter(nearStrip);
+  if (boardEdges.length && (!reserve(boardEdges.length) ||
+      !segmentIn(p, q, boardEdges, inside) || !segmentIn(nextP, nextQ, boardEdges, inside) ||
+      boardEdges.some(edge => edge.some(inStrip)))) return false;
+
+  const regions = [...new Set(planes)].map(id => meshPlanes.get(id)).filter(Boolean);
+  if (!regions.length) return true;
+  const boundaries = regions.flatMap(region => region.copperEdges.filter(nearStrip));
+  if (!boundaries.length) return true;
+  const contains = v => regions.some(region => region.contains(v));
+  if (!reserve(boundaries.length) || !perimeter.every(([a, b]) => segmentIn(a, b, boundaries, contains))) return false;
+  for (const [a, b, c] of [[p, q, nextQ], [p, nextQ, nextP]]) {
+    if (Math.abs(cross(b.x - a.x, b.y - a.y, c.x - a.x, c.y - a.y)) > EPS &&
+        !contains(point((a.x + b.x + c.x) / 3, (a.y + b.y + c.y) / 3))) return false;
   }
-  if (vertices.length > 210 || ports.size > 56) return false;
-  const edges = vertices.map(() => []);
-  const planeEdges = plane.rings.flatMap(ringEdges);
-  const boundary = planeEdges.concat(board.edges);
-  const contains = p => insideBoard(p) && inCopper(p, planeEdges);
-  for (let i = 0; i < vertices.length; i++) {
-    for (let j = i + 1; j < vertices.length; j++) {
-      if (!segmentIn(vertices[i], vertices[j], boundary, contains)) continue;
-      const length = distance(vertices[i], vertices[j]);
-      edges[i].push([j, length]);
-      edges[j].push([i, length]);
+
+  // Copper boundaries within the strip are harmless where another fill covers
+  // them. An exposed edge inside the strip separates two physical passages.
+  for (const [a, b] of boundaries) {
+    const length = distance(a, b);
+    if (length <= EPS) continue;
+    if (!reserve(boundaries.length)) return false;
+    const breaks = cuts(a, b, perimeter.concat(boundaries));
+    for (let i = 1; i < breaks.length; i++) {
+      const mid = at(a, b, (breaks[i - 1] + breaks[i]) / 2);
+      if (!inStrip(mid)) continue;
+      const dx = (b.y - a.y) * 1e-4 / length, dy = (a.x - b.x) * 1e-4 / length;
+      if (!contains(point(mid.x + dx, mid.y + dy)) || !contains(point(mid.x - dx, mid.y - dy))) return false;
     }
-  }
-  const portIds = [...idSet], links = [];
-  for (let i = 0; i < portIds.length; i++) {
-    const dist = new Float64Array(vertices.length).fill(Infinity);
-    const previous = new Int32Array(vertices.length).fill(-1);
-    const queue = new MinHeap();
-    dist[i] = 0;
-    queue.push(i, 0);
-    while (queue.size) {
-      const { value: from, rank } = queue.pop();
-      if (rank > dist[from]) continue;
-      for (const [to, weight] of edges[from]) {
-        const candidate = rank + weight;
-        if (candidate + EPS >= dist[to]) continue;
-        dist[to] = candidate;
-        previous[to] = from;
-        queue.push(to, candidate);
-      }
-    }
-    for (let j = i + 1; j < portIds.length; j++) {
-      if (!Number.isFinite(dist[j])) continue;
-      const path = [];
-      for (let cursor = j; cursor !== -1; cursor = previous[cursor]) path.push(vertices[cursor]);
-      links.push([portIds[i], portIds[j], dist[j], path.reverse()]);
-    }
-  }
-  for (const [a, b, length, path] of links) {
-    graph.connect(a, b, length, 'plane', path, [plane.layer], plane.id);
   }
   return true;
+}
+
+function similarRouteShapes(a, b, context) {
+  if (!a.length || !b.length || a.runs.length !== b.runs.length || !context.reserve(1)) return false;
+  const tolerance = Math.min(ROUTE_SIMILARITY_MIL, a.length * 0.02, b.length * 0.02);
+  const position = (span, offset) => at(span.a, span.b, clamp((offset - span.start) / (span.end - span.start)));
+  const strips = [];
+  for (const [index, run] of a.runs.entries()) {
+    const other = b.runs[index];
+    if (run.layer !== other.layer) return false;
+    let start = 0;
+    for (let i = 0, j = 0; i < run.spans.length && j < other.spans.length;) {
+      const first = run.spans[i], second = other.spans[j];
+      const endA = first.end / run.length, endB = second.end / other.length;
+      const end = Math.min(endA, endB);
+      const p = position(first, start * run.length), q = position(second, start * other.length);
+      const nextP = position(first, end * run.length), nextQ = position(second, end * other.length);
+      const firstGap = distance(p, q), nextGap = distance(nextP, nextQ);
+      if (firstGap > tolerance || nextGap > tolerance) return false;
+      if (firstGap > EPS || nextGap > EPS) strips.push([p, q, nextP, nextQ, [first.plane, second.plane]]);
+      start = end;
+      if (endA <= endB) i++;
+      if (endB <= endA) j++;
+    }
+  }
+  return strips.every(args => sameRouteStrip(...args, context));
+}
+
+function* compressRouteGraph(graph, start, end, suppressed, materialize, similarity) {
+  const { nodes } = graph;
+  const endpointVias = [start, end].filter(id => nodes[id].edges.length > 1).map(id => nodes[id].p);
+  const links = nodes.map(node => node.edges.filter(edge =>
+    edge.kind !== 'via' || (!suppressed.has(edge.id) && !endpointVias.some(p => distance(p, edge.path[0]) <= SNAP))));
+  const degree = Int32Array.from(links, edges => edges.length);
+  const leaves = [];
+  for (let id = 0; id < degree.length; id++) {
+    if (id !== start && id !== end && degree[id] === 1) leaves.push(id);
+  }
+  for (let i = 0; i < leaves.length; i++) {
+    if (i % 512 === 0) yield '压缩同网连接图';
+    const id = leaves[i];
+    degree[id] = 0;
+    for (const { to } of links[id]) {
+      if (degree[to] && --degree[to] === 1 && to !== start && to !== end) leaves.push(to);
+    }
+  }
+
+  const junctions = nodes.map(() => []);
+  const terminals = new Set([...links[start], ...links[end]].map(edge => edge.to));
+  for (let id = 0; id < nodes.length; id++) {
+    if (id % 512 === 0) yield '压缩同网连接图';
+    if (!degree[id] || (degree[id] === 2 && !terminals.has(id) && id !== start && id !== end)) continue;
+    for (const first of links[id]) {
+      if (!degree[first.to]) continue;
+      let last = first, length = first.length;
+      const edges = [first];
+      while (last.to !== start && last.to !== end && !terminals.has(last.to) && degree[last.to] === 2) {
+        const next = links[last.to].find(edge => degree[edge.to] && edge.id !== (last.id ^ 1));
+        edges.push(next);
+        length += next.length;
+        last = next;
+      }
+      if (last.to !== id) junctions[id].push({ to: last.to, edges, length,
+        hasVia: edges.some(edge => edge.kind === 'via') });
+    }
+  }
+  const discarded = new Set();
+  for (const [id, outgoing] of junctions.entries()) {
+    if (id % 512 === 0) yield '合并相近的并行支路';
+    const parallel = new Map();
+    for (const link of outgoing) {
+      if (link.to <= id || link.edges.some(edge => edge.kind === 'via' || edge.kind === 'endpoint')) continue;
+      if (!parallel.has(link.to)) parallel.set(link.to, []);
+      parallel.get(link.to).push(link);
+    }
+    for (const alternatives of parallel.values()) {
+      if (alternatives.length < 2) continue;
+      const representatives = [];
+      const candidates = alternatives.map(link => ({ link, route: materialize(link.edges) }))
+        .filter(item => item.route).sort((a, b) => a.route.length - b.route.length);
+      for (const { link, route } of candidates) {
+        const shape = routeShape(route.edges);
+        if (representatives.some(item => similarRouteShapes(shape, item, similarity))) {
+          discarded.add(link.edges[0].id);
+          discarded.add(link.edges.at(-1).id ^ 1);
+        } else representatives.push(shape);
+      }
+    }
+  }
+  if (discarded.size) {
+    for (const [id, edges] of junctions.entries()) {
+      junctions[id] = edges.filter(link => !discarded.has(link.edges[0].id));
+    }
+  }
+  return { links: junctions, collapsedBranches: discarded.size / 2 };
+}
+
+function* distancesToTarget(links, end, allowed, stage) {
+  const remaining = new Float64Array(links.length).fill(Infinity);
+  const queue = new MinHeap();
+  remaining[end] = 0;
+  queue.push(end, 0);
+  let work = 0;
+  while (queue.size) {
+    if (++work % 512 === 0) yield { stage, detail: '估算到目标的距离' };
+    const { value: id, rank } = queue.pop();
+    if (rank > remaining[id]) continue;
+    for (const edge of links[id]) {
+      if (!allowed(edge)) continue;
+      const length = rank + edge.length;
+      if (length >= remaining[edge.to]) continue;
+      remaining[edge.to] = length;
+      queue.push(edge.to, length);
+    }
+  }
+  return remaining;
+}
+
+function routeTopology(edges, shape) {
+  const changes = edges.filter(edge => edge.kind === 'via')
+    .map(edge => keyOf(edge.path[0], edge.layers.join('>')));
+  return shape.runs.map(run => run.layer).join(',') + '|' + changes.join('|');
+}
+
+function* enumerateRoutes(graph, start, end, finishRoute, materialize, suppressed, board, inside, meshPlanes, trace) {
+  let similarityWork = 0;
+  const similarity = { board, inside, meshPlanes,
+    reserve: steps => (similarityWork += Math.max(1, steps)) <= SIMILARITY_WORK_BUDGET };
+  const { links, collapsedBranches } =
+    yield* compressRouteGraph(graph, start, end, suppressed, materialize, similarity);
+  const compressionSimilarityWork = similarityWork;
+  const groups = new Map(), signatures = new Set();
+  let retainedPoints = 0, routeCount = 0, mergedRoutes = 0;
+
+  function keepRoute(chains, orientedEdges, signature) {
+    if (signature && signatures.has(signature)) return 'duplicate';
+    const route = finishRoute(chains.flatMap(orientedEdges).filter(edge => edge.kind !== 'endpoint'));
+    if (!route) return 'invalid';
+    const shape = routeShape(route.edges);
+    const key = routeTopology(route.edges, shape);
+    const alternatives = groups.get(key) || [];
+    const replaced = new Set();
+    for (const candidate of alternatives) {
+      if (!similarRouteShapes(shape, candidate.shape, similarity)) continue;
+      if (candidate.route.length <= route.length + EPS) {
+        mergedRoutes++;
+        return 'duplicate';
+      }
+      replaced.add(candidate);
+    }
+    if (similarityWork > SIMILARITY_WORK_BUDGET) return 'similarity-work';
+    const points = route.edges.reduce((total, edge) => total + edge.path.length + 1, 0) +
+      shape.runs.reduce((total, run) => total + 2 * run.spans.length, 0);
+    for (const candidate of replaced) {
+      retainedPoints -= candidate.points;
+      signatures.delete(candidate.signature);
+    }
+    if (signature) signatures.add(signature);
+    retainedPoints += points;
+    const kept = replaced.size ? alternatives.filter(candidate => !replaced.has(candidate)) : alternatives;
+    kept.push({ route, shape, points, signature });
+    groups.set(key, kept);
+    routeCount += 1 - replaced.size;
+    mergedRoutes += replaced.size;
+    return replaced.size ? 'replaced' : 'added';
+  }
+
+  function* pass(from, to, direction, stage) {
+    similarityWork = 0;
+    yield { stage, detail: '已保留 ' + routeCount + ' 类' };
+    const report = data => trace('solver.enumeration', { ...data, direction, routes: routeCount,
+      retainedPoints, collapsedBranches, mergedRoutes, transitionSequences: groups.size, similarityWork,
+      compressionSimilarityWork });
+    return yield* searchRoutes(graph, links, from, to, direction, stage, keepRoute, () => routeCount, report);
+  }
+
+  const forward = yield* pass(start, end, 'forward', '正向搜索连通路径');
+  let limited = forward.limited;
+  if (forward.connected) {
+    const reverse = yield* pass(end, start, 'reverse', '从流入点反向搜索');
+    limited ||= reverse.limited;
+    const endLayers = new Set(links[end].map(link => graph.nodes[link.to].layer));
+    if (links[start].some(link => endLayers.has(graph.nodes[link.to].layer))) {
+      const sameLayer = yield* pass(start, end, 'same-layer', '搜索不换层路径');
+      limited ||= sameLayer.limited;
+    } else {
+      trace('solver.enumeration', { direction: 'same-layer', connected: false, reason: 'no-shared-layer',
+        routes: routeCount, added: 0 });
+    }
+  }
+  const routes = [...groups.values()].flatMap(items => items.map(item => item.route));
+  return { routes, limited, collapsedBranches, mergedRoutes };
+}
+
+function* searchRoutes(graph, links, start, end, direction, stage, keepRoute, routeCount, report) {
+  const allowed = link => direction !== 'same-layer' || !link.hasVia;
+  const remaining = yield* distancesToTarget(links, end, allowed, stage);
+  if (!Number.isFinite(remaining[start])) {
+    report({ connected: false, added: 0 });
+    return { connected: false, limited: false };
+  }
+  for (const [i, edges] of links.entries()) {
+    if (i % 512 === 0) yield { stage, detail: '排列优先搜索的支路' };
+    edges.sort((a, b) => (a.length + remaining[a.to]) - (b.length + remaining[b.to]));
+  }
+  const starts = new Set(links[start].map(edge => edge.to));
+  const ends = new Set(links[end].map(edge => edge.to));
+  const visited = new Uint32Array(links.length);
+  const frontier = new MinHeap();
+  const startProbes = [], branchProbes = [], scheduledBranches = new Set(), coveredBranches = new Set();
+  const startBudget = { runs: 0, solutions: 0, work: 0, limit: START_PROBE_TOTAL_STEPS };
+  const branchBudget = { runs: 0, solutions: 0, work: 0, limit: BRANCH_PROBE_TOTAL_STEPS };
+  const probedPaths = new Set();
+  const blocked = new Uint32Array(links.length);
+  const measured = new Uint32Array(links.length);
+  const probeCosts = new Float64Array(links.length);
+  let work = 0, stateCount = 1, frontierPeak = 1, expanded = 0;
+  let nextStartProbe = 0, initialStartProbes = 0, nextProbe = 0, probeStamp = 0, waveSteps = 0;
+  let preferStart = true;
+  let found = false, added = 0, duplicates = 0, replacements = 0, waveLimited = false, limit = '';
+  let deadline = Date.now() + SEARCH_TIME_MS;
+  const root = { id: start, cost: 0, depth: 0, previous: null, link: null };
+  frontier.push(root, remaining[start]);
+
+  const usable = (id, link) => allowed(link) && Number.isFinite(remaining[link.to]) &&
+    (id === start || !starts.has(link.to)) && (!ends.has(id) || link.to === end);
+  const branchId = link => link.edges[0].id;
+  const reverse = direction === 'reverse';
+  // Match the corresponding compressed link in the canonical A-to-B direction.
+  const edgeId = reverse ? link => link.edges.at(-1).id ^ 1 : branchId;
+  const orientedEdges = reverse ?
+    link => links[link.to].find(candidate => branchId(candidate) === edgeId(link)).edges : link => link.edges;
+  function* progress() {
+    const paused = Date.now();
+    yield { stage, detail: '已保留 ' + routeCount() + ' 类' };
+    deadline += Date.now() - paused;
+  }
+
+  function startDirection(link, origin) {
+    for (const edge of link.edges) {
+      if (edge.kind === 'via') return edge.layers.join('>');
+      for (const p of edge.path) {
+        if (distance(origin, p) <= SNAP) continue;
+        const angle = Math.atan2(p.y - origin.y, p.x - origin.x);
+        return (Math.round(angle / (Math.PI / 4)) + 8) % 8;
+      }
+    }
+    return 'coincident';
+  }
+
+  function scheduleStartDirections() {
+    const layers = [];
+    for (const access of links[start]) {
+      if (!usable(start, access)) continue;
+      // The first edge selects a copper layer at the endpoint. Probe the
+      // actual exit on that layer so a second direction gets its own search.
+      const prefix = { id: access.to, cost: access.length, depth: 1, previous: root, link: access };
+      const sectors = new Map();
+      for (const link of links[prefix.id]) {
+        if (link.to === start || !usable(prefix.id, link) || coveredBranches.has(branchId(link))) continue;
+        const direction = startDirection(link, graph.nodes[prefix.id].p);
+        if (!sectors.has(direction)) sectors.set(direction, []);
+        sectors.get(direction).push(link);
+      }
+      if (sectors.size) layers.push({ prefix, sectors: [...sectors.values()] });
+    }
+    const sectorCount = layers.reduce((count, layer) => Math.max(count, layer.sectors.length), 0);
+    for (let variant = 0; startProbes.length < START_PROBE_LIMIT; variant++) {
+      let offered = false;
+      for (let sector = 0; sector < sectorCount && startProbes.length < START_PROBE_LIMIT; sector++) {
+        for (const { prefix, sectors } of layers) {
+          const link = sectors[sector]?.[variant];
+          if (!link) continue;
+          startProbes.push({ prefix, link });
+          scheduledBranches.add(branchId(link));
+          offered = true;
+          if (startProbes.length === START_PROBE_LIMIT) break;
+        }
+      }
+      if (variant === 0) initialStartProbes = startProbes.length;
+      if (!offered) break;
+    }
+  }
+
+  function scheduleBranches(state) {
+    const prefixes = [];
+    for (let cursor = state; cursor.previous; cursor = cursor.previous) {
+      coveredBranches.add(branchId(cursor.link));
+      coveredBranches.add(cursor.link.edges.at(-1).id ^ 1);
+      prefixes.push(cursor.previous);
+    }
+    if (!found) scheduleStartDirections();
+    if (branchProbes.length >= BRANCH_PROBE_LIMIT || branchBudget.work >= branchBudget.limit) return;
+    const forks = [];
+    for (const prefix of prefixes.reverse()) {
+      if (prefix.id === start || starts.has(prefix.id)) continue;
+      const choices = links[prefix.id].filter(link => usable(prefix.id, link) &&
+        !coveredBranches.has(branchId(link)) && !scheduledBranches.has(branchId(link)));
+      if (choices.length) forks.push({ prefix, choices });
+    }
+    // Spread probes along the route before trying several exits at one junction.
+    const ordered = forks.length > 1 ? [forks[0], forks.at(-1)] : forks.slice();
+    const ranges = [[1, forks.length - 1]];
+    for (let i = 0; i < ranges.length && ordered.length < BRANCH_PROBE_LIMIT; i++) {
+      const [from, to] = ranges[i];
+      if (from >= to) continue;
+      const mid = Math.floor((from + to) / 2);
+      ordered.push(forks[mid]);
+      ranges.push([from, mid], [mid + 1, to]);
+    }
+    for (let exit = 0; ordered.length && branchProbes.length < BRANCH_PROBE_LIMIT; exit++) {
+      let offered = false;
+      for (const { prefix, choices } of ordered) {
+        const link = choices[exit];
+        if (!link) continue;
+        offered = true;
+        scheduledBranches.add(branchId(link));
+        branchProbes.push({ prefix, link });
+        if (branchProbes.length === BRANCH_PROBE_LIMIT) break;
+      }
+      if (!offered) break;
+    }
+  }
+
+  function* probeBranch({ prefix, link }, budget) {
+    if (coveredBranches.has(branchId(link))) return;
+    const stamp = ++probeStamp;
+    budget.runs++;
+    for (let cursor = prefix; cursor; cursor = cursor.previous) blocked[cursor.id] = stamp;
+    if (blocked[link.to] === stamp) return;
+    const pending = new MinHeap();
+    const first = { id: link.to, cost: prefix.cost + link.length, depth: prefix.depth + 1, previous: prefix, link };
+    measured[first.id] = stamp;
+    probeCosts[first.id] = first.cost;
+    pending.push(first, first.cost + remaining[first.id], -first.depth);
+    const stopAt = Math.min(budget.work + BRANCH_PROBE_STEPS, budget.limit);
+    while (pending.size && budget.work < stopAt && Date.now() < deadline) {
+      const { value: state } = pending.pop();
+      if (state.cost > probeCosts[state.id]) continue;
+      if (state.id === end) return state;
+      for (const next of links[state.id]) {
+        if (budget.work >= stopAt) return;
+        if (++budget.work % 256 === 0) yield* progress();
+        if (blocked[next.to] === stamp || !usable(state.id, next)) continue;
+        const cost = state.cost + next.length;
+        if (measured[next.to] === stamp && probeCosts[next.to] <= cost) continue;
+        measured[next.to] = stamp;
+        probeCosts[next.to] = cost;
+        const depth = state.depth + 1;
+        pending.push({ id: next.to, cost, depth, previous: state, link: next }, cost + remaining[next.to], -depth);
+      }
+    }
+  }
+
+  function considerRoute(state, fromProbe = false) {
+    const chains = [];
+    for (let current = state; current.link; current = current.previous) chains.push(current.link);
+    if (!reverse) chains.reverse();
+    // Use forward edge IDs for both directions. Reuse the original forward
+    // edges so path geometry, via order and copper portals stay consistent.
+    const signature = chains.length <= 512 ? chains.map(edgeId).join(',') : '';
+    if (signature) {
+      if (probedPaths.has(signature)) return false;
+      if (fromProbe) probedPaths.add(signature);
+    }
+    const outcome = keepRoute(chains, orientedEdges, signature);
+    switch (outcome) {
+      case 'invalid': return false;
+      case 'duplicate': duplicates++; break;
+      case 'replaced': replacements++; break;
+      case 'added': added++; break;
+      default: limit = outcome; return false;
+    }
+    // The first route of a later pass can already be in the list. Its
+    // unused exits still need to be explored in this direction.
+    if (!found || outcome === 'added') scheduleBranches(state);
+    if (!found) waveSteps = 16;
+    found = true;
+    return outcome === 'added';
+  }
+
+  while (!limit) {
+    const canProbeStart = nextStartProbe < startProbes.length && startBudget.work < startBudget.limit;
+    const canProbeBranch = nextProbe < branchProbes.length && branchBudget.work < branchBudget.limit;
+    if (!frontier.size && !canProbeStart && !canProbeBranch) break;
+    if (work >= SEARCH_STEP_BUDGET || Date.now() >= deadline) {
+      limit = work >= SEARCH_STEP_BUDGET ? 'search-steps' : 'search-time';
+      break;
+    }
+    // Probe an unused exit periodically so longer passages have a chance
+    // before the length-ordered wave fills the result budget.
+    const firstStartPass = canProbeStart && nextStartProbe < initialStartProbes;
+    if ((canProbeStart || canProbeBranch) && (firstStartPass || waveSteps >= 16 || !frontier.size)) {
+      const fromStart = canProbeStart && (firstStartPass || !canProbeBranch || preferStart);
+      const budget = fromStart ? startBudget : branchBudget;
+      const probe = fromStart ? startProbes[nextStartProbe++] : branchProbes[nextProbe++];
+      const solution = yield* probeBranch(probe, budget);
+      if (solution && considerRoute(solution, true)) budget.solutions++;
+      preferStart = !fromStart;
+      waveSteps = 0;
+      continue;
+    }
+    if (++expanded % 256 === 0) yield* progress();
+    waveSteps++;
+    const { value: state } = frontier.pop();
+    if (state.id === end) {
+      considerRoute(state);
+      continue;
+    }
+
+    for (let current = state; current; current = current.previous) visited[current.id] = expanded;
+    for (const link of links[state.id]) {
+      if (++work > SEARCH_STEP_BUDGET) break;
+      if (visited[link.to] === expanded || !usable(state.id, link)) continue;
+      if (stateCount >= MAZE_STATE_LIMIT) {
+        waveLimited = true;
+        break;
+      }
+      const cost = state.cost + link.length;
+      const depth = state.depth + 1;
+      frontier.push({ id: link.to, cost, depth, previous: state, link }, cost + remaining[link.to], -depth);
+      stateCount++;
+    }
+    frontierPeak = Math.max(frontierPeak, frontier.size);
+  }
+  if (!limit && waveLimited) limit = 'maze-states';
+  report({ algorithm: 'weighted-maze', connected: true, added, duplicates, replacements, steps: work,
+    expanded, stateCount, frontierPeak,
+    startProbes: startBudget.runs, startSolutions: startBudget.solutions, startProbeSteps: startBudget.work,
+    branchProbes: branchBudget.runs, branchSolutions: branchBudget.solutions, probeSteps: branchBudget.work,
+    limit: limit || null, budgets: { states: MAZE_STATE_LIMIT, steps: SEARCH_STEP_BUDGET, searchMs: SEARCH_TIME_MS } });
+  return { connected: true, limited: Boolean(limit) };
 }
 
 const minX = edge => Math.min(edge[0].x, edge[1].x);
@@ -394,9 +956,12 @@ function* copperMesh(graph, plane, copperEdges, board, inside, ports) {
       });
     }
   }
+  let boundaryWork = 0;
   for (const edge of boardEdges) {
     const limit = boundsOf([edge]);
     for (const [a, b] of copperEdges) {
+      if (++boundaryWork % 4096 === 0) yield '搜索覆铜绕行路线';
+      if (boundaryWork > 3000000 || breaks.length > 150000) return false;
       if (Math.max(a.x, b.x) < limit.left - EPS || Math.min(a.x, b.x) > limit.right + EPS ||
           Math.max(a.y, b.y) < limit.bottom - EPS || Math.min(a.y, b.y) > limit.top + EPS) continue;
       for (const t of intersections(a, b, ...edge)) breaks.push(at(a, b, t).x);
@@ -452,7 +1017,7 @@ function* copperMesh(graph, plane, copperEdges, board, inside, ports) {
       if (high - low > EPS) {
         const gate = point(x, (low + high) / 2);
         if (onBoard(gate)) graph.connect(a.node, b.node, distance(a.center, gate) + distance(gate, b.center),
-          'mesh', [a.center, gate, b.center], [layer], id);
+          'mesh', [a.center, gate, b.center], [layer], id, 0, [point(x, high), point(x, low)]);
       }
       if (aTop <= bTop + EPS) j++;
       if (bTop <= aTop + EPS) k++;
@@ -586,7 +1151,42 @@ function refineCopperPath(path, boundary, contains, budget, divisor = SHORT_MIDD
   return path;
 }
 
-function mergeMeshRoute(edges, meshPlanes, inside, budget) {
+// String-pull through the ordered gates of the chosen cells. The gate order
+// keeps paths on their chosen side of a cutout, even if another shortcut exists.
+function pathThroughPortals(start, end, portals) {
+  const area = (a, b, c) => cross(b.x - a.x, b.y - a.y, c.x - a.x, c.y - a.y);
+  const path = [start], gates = [[start, start], ...portals, [end, end]];
+  let left = 0, right = 0;
+  let leftPoint = start, rightPoint = start;
+  for (let i = 1; i < gates.length; i++) {
+    const apex = path.at(-1), [l, r] = gates[i];
+    if (area(apex, rightPoint, r) >= -EPS) {
+      if (distance(apex, rightPoint) <= EPS || area(apex, leftPoint, r) < -EPS) {
+        right = i;
+        rightPoint = r;
+      } else {
+        path.push(leftPoint);
+        i = right = left;
+        rightPoint = leftPoint;
+        continue;
+      }
+    }
+    if (area(apex, leftPoint, l) <= EPS) {
+      if (distance(apex, leftPoint) <= EPS || area(apex, rightPoint, l) > EPS) {
+        left = i;
+        leftPoint = l;
+      } else {
+        path.push(rightPoint);
+        i = left = right;
+        leftPoint = rightPoint;
+      }
+    }
+  }
+  if (distance(path.at(-1), end) > EPS) path.push(end);
+  return path;
+}
+
+function mergeMeshRoute(edges, meshPlanes, inside, budget, cache = { sections: new Map(), points: 0 }) {
   const result = [];
   for (let i = 0; i < edges.length; i++) {
     const edge = edges[i];
@@ -594,25 +1194,33 @@ function mergeMeshRoute(edges, meshPlanes, inside, budget) {
       result.push(edge);
       continue;
     }
-    const points = edge.path.slice();
-    while (edges[i + 1]?.kind === 'mesh' && edges[i + 1].plane === edge.plane) {
-      points.push(...edges[++i].path.slice(1));
+    const start = i;
+    while (edges[i + 1]?.kind === 'mesh' && edges[i + 1].plane === edge.plane) i++;
+    const run = edges.slice(start, i + 1);
+    const key = edge.id == null || run.length > 512 ? null : run.map(item => item.id).join(',');
+    if (key !== null && cache.sections.has(key)) {
+      result.push(cache.sections.get(key));
+      continue;
     }
     const region = meshPlanes.get(edge.plane);
     const contains = p => inside(p) && region.contains(p);
-    const path = [points[0]];
-    for (let from = 0; from < points.length - 1;) {
-      let to = points.length - 1;
-      while (!segmentIn(points[from], points[to], region.boundary, contains)) {
-        if (to === from + 1) return null;
-        to = from + Math.ceil((to - from) / 2);
-      }
-      path.push(points[to]);
-      from = to;
+    const portals = run.flatMap(item => item.portal ? [item.portal] : []);
+    let path = pathThroughPortals(edge.path[0], run.at(-1).path.at(-1), portals);
+    const legal = points => points.every((p, j) =>
+      !j || segmentIn(points[j - 1], p, region.boundary, contains));
+    if (!legal(path)) {
+      path = [edge.path[0], ...run.flatMap(item => item.path.slice(1))];
+      if (!legal(path)) return null;
+      refineCopperPath(path, region.boundary, contains, budget);
     }
-    refineCopperPath(path, region.boundary, contains, budget);
     const length = path.slice(1).reduce((sum, p, j) => sum + distance(path[j], p), 0);
-    result.push({ ...edge, kind: 'plane', path, length });
+    const section = { kind: 'plane', layers: edge.layers, plane: edge.plane, path, length };
+    const cost = run.length + path.length;
+    if (key !== null && cache.points + cost <= 12000) {
+      cache.sections.set(key, section);
+      cache.points += cost;
+    }
+    result.push(section);
   }
   return { edges: result, length: result.reduce((sum, edge) => sum + edge.length, 0) };
 }
@@ -658,7 +1266,7 @@ function buildRoutePreview(route, visible, density, board, regions) {
   }
   let run = [], sources = [], layer;
   const flush = () => {
-    if (run.length > 1) {
+    if (run.length > 1 && density > 0) {
       const rounded = [run[0]];
       for (let i = 1; i < run.length - 1; i++) {
         rounded.push(...roundedPreviewCorner(run[i - 1], run[i], run[i + 1], sources[i - 1], sources[i],
@@ -666,6 +1274,8 @@ function buildRoutePreview(route, visible, density, board, regions) {
       }
       rounded.push(run.at(-1));
       paths.push({ layer, points: rounded });
+    } else if (run.length > 1) {
+      paths.push({ layer, points: run });
     }
     run = [];
     sources = [];
@@ -754,14 +1364,14 @@ function copperContact(anchor, edges, stroke = 0) {
   return nearest;
 }
 
-function computeRoutes(...args) {
-  const search = routeSearch(...args);
+function computeRoutes(model, start, end, board) {
+  const search = routeSearch(model, start, end, board);
   let step;
   do { step = search.next(); } while (!step.done);
   return step.value;
 }
 
-function* routeSearch(model, start, end, board, maxRoutes = 100) {
+function* routeSearch(model, start, end, board, trace = () => {}) {
   const inside = validateEnds(start, end, board);
   yield '建立走线和过孔连接';
   const graph = new RouteGraph(), warnings = new Set(model.warnings);
@@ -782,6 +1392,7 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
     const left = s => Math.min(s.a.x, s.b.x);
     list.sort((a, b) => left(a) - left(b));
     for (let i = 0; i < list.length; i++) {
+      if (i % 64 === 0) yield '建立走线和过孔连接';
       const a = list[i], right = Math.max(a.a.x, a.b.x);
       for (let j = i + 1; j < list.length && left(list[j]) <= right + SNAP; j++) {
         const b = list[j];
@@ -819,7 +1430,8 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
   });
 
   const padsByLayer = new Map();
-  for (const anchor of model.anchors) {
+  for (const [index, anchor] of model.anchors.entries()) {
+    if (index % 32 === 0) yield '建立走线和过孔连接';
     if (!inside(anchor.p)) continue;
     const depth = model.depthsMm;
     const copper = depth && anchor.layers.length > 1 ?
@@ -868,7 +1480,7 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
   let incomplete = false;
   for (const plane of model.planes) {
     yield '连接铜区与焊盘、过孔';
-    const edges = plane.rings.flatMap(ringEdges), ports = new Map(), terminalPorts = new Map();
+    const edges = plane.rings.flatMap(ringEdges), ports = new Map();
     if (edges.length > 32000) {
       incomplete = true;
       warnings.add('部分覆铜轮廓超过求解容量，结果可能不完整。');
@@ -876,34 +1488,26 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
     }
     const box = boundsOf(edges);
     const contains = copperContains(edges, box);
-    const addPort = (p, terminal = -1) => {
+    const addPort = p => {
       if (!inside(p)) return;
       const id = graph.node(p, plane.layer);
       ports.set(id, p);
-      if (terminal >= 0) terminalPorts.set(terminal, { id, p });
     };
-    const connectAnchor = (anchor, terminal = -1) => {
+    const connectAnchor = anchor => {
       const path = copperContact(anchor, edges, plane.stroke);
       if (!path || !segmentIn(path[0], path[1], board.edges, inside) ||
           !segmentIn(path[1], path[2], board.edges, inside)) return;
       const contact = path.at(-1);
-      addPort(contact, terminal);
+      addPort(contact);
       graph.connect(graph.node(anchor.p, plane.layer), graph.node(contact, plane.layer),
         distance(path[0], path[1]) + distance(path[1], path[2]), 'pad', path, [plane.layer]);
     };
-    for (const [i, terminal] of terminals.entries()) {
+    for (const terminal of terminals) {
       if (!terminal.layers.includes(plane.layer) || !inside(terminal.p)) continue;
       if (contains(terminal.p)) {
-        addPort(terminal.p, i);
+        addPort(terminal.p);
       } else if (!terminal.track) {
-        connectAnchor(terminal, i);
-      }
-    }
-    // Keep the exact straight path when both terminals can see each other inside the copper.
-    if (terminalPorts.size === 2) {
-      const a = terminalPorts.get(0), b = terminalPorts.get(1);
-      if (segmentIn(a.p, b.p, edges.concat(board.edges), p => inside(p) && contains(p))) {
-        graph.connect(a.id, b.id, distance(a.p, b.p), 'plane', [a.p, b.p], [plane.layer], plane.id);
+        connectAnchor(terminal);
       }
     }
     const layerSegments = layers.get(plane.layer) || [];
@@ -993,7 +1597,8 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
     }
   }
 
-  for (const segment of segments) {
+  for (const [index, segment] of segments.entries()) {
+    if (index % 128 === 0) yield '建立走线和过孔连接';
     const ts = uniqueSorted(segment.cuts);
     for (let i = 1; i < ts.length; i++) {
       const a = at(segment.a, segment.b, ts[i - 1]), b = at(segment.a, segment.b, ts[i]);
@@ -1005,9 +1610,8 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
   for (const { plane, ports, edges, contains } of planeJobs) {
     yield '搜索覆铜绕行路线';
     if (ports.size < 2) continue;
-    if (edges.length + ports.size <= 110 && ports.size <= 36 && routeWithinPlane(graph, plane, board, inside, ports)) continue;
     if (yield* copperMesh(graph, plane, edges, board, inside, ports)) {
-      meshPlanes.set(plane.id, { contains, boundary: edges.concat(board.edges) });
+      meshPlanes.set(plane.id, { contains, copperEdges: edges, boundary: edges.concat(board.edges) });
     } else {
       incomplete = true;
       warnings.add('部分覆铜分区超过求解容量，结果可能不完整。');
@@ -1021,104 +1625,36 @@ function* routeSearch(model, start, end, board, maxRoutes = 100) {
     }
     return root;
   });
-  const seen = new Set();
   const refinementBudget = { remaining: COPPER_REFINEMENT_BUDGET };
-  const finish = meshPlanes.size ? edges => {
-    const route = mergeMeshRoute(edges, meshPlanes, inside, refinementBudget);
-    if (!route) return null;
-    const key = route.edges.map(edge => edge.kind + ':' + edge.layers.join(',') + ':' +
-      edge.path.map(p => keyOf(p, '')).join(';')).join('|');
-    if (seen.has(key)) return null;
-    seen.add(key);
+  const { suppressed, count: mergedVias, limited: mergeLimited } =
+    yield* suppressNearbyVias(graph, model.anchors, terminals, meshPlanes, board, inside);
+  trace('solver.graph', { nodes: graph.nodes.length, edges: graph.edgeKeys.size, trackSegments: segments.length,
+    copperRegions: planeJobs.length, meshedRegions: meshPlanes.size, mergedVias, suppressedViaEdges: suppressed.size / 2,
+    mergeRadiusMm: VIA_CLUSTER_MM, mergeDistanceToleranceMm: VIA_DISTANCE_TOLERANCE * 0.0254,
+    mergeLimited: Boolean(mergeLimited), incomplete });
+  const meshCache = { sections: new Map(), points: 0 };
+  const materialize = edges => mergeMeshRoute(edges, meshPlanes, inside, refinementBudget, meshCache);
+  const finish = edges => {
+    const route = materialize(edges);
+    if (!route) {
+      incomplete = true;
+      warnings.add('部分铜区通道未通过完整几何校验，结果可能不完整。');
+    }
     return route;
-  } : undefined;
-  yield '枚举并排序候选路径';
-  const result = yield* enumerateRoutes(graph, ids[0], ids[1], maxRoutes, finish);
-  result.routes.sort((a, b) => a.length - b.length);
-  if (refinementBudget.exhausted) warnings.add('部分复杂铜区候选达到倒角优化上限，保留已验证的路径。');
-  return { ...result, incomplete, warnings: [...warnings] };
-}
-
-const SIMILAR_PATH_DISTANCE = 4; // mil
-const SIMILAR_PATH_SAMPLES = 128;
-
-function describeRouteShape(route) {
-  const sections = [], segments = [], byLayer = new Map();
-  let length = 0;
-  for (const edge of route.edges) {
-    const layer = edge.layers[0];
-    if (edge.kind === 'via') {
-      sections.push(keyOf(edge.path[0], edge.layers.join('>')));
-      continue;
-    }
-    if (sections.at(-1) !== layer) sections.push(layer);
-    if (!byLayer.has(layer)) byLayer.set(layer, []);
-    for (let i = 1; i < edge.path.length; i++) {
-      const a = edge.path[i - 1], b = edge.path[i], span = distance(a, b);
-      if (span <= EPS) continue;
-      const segment = { a, b, span, layer };
-      length += span;
-      segments.push(segment);
-      byLayer.get(layer).push(segment);
-    }
-  }
-  const samples = [];
-  for (let i = 0, j = 0, passed = 0; i < SIMILAR_PATH_SAMPLES && length > 0; i++) {
-    const offset = length * (i + 0.5) / SIMILAR_PATH_SAMPLES;
-    while (j + 1 < segments.length && offset > passed + segments[j].span) passed += segments[j++].span;
-    const { a, b, span, layer } = segments[j];
-    samples.push({ layer, p: at(a, b, (offset - passed) / span) });
-  }
-  const nearbyByLayer = new Map();
-  for (const [layer, items] of byLayer) {
-    if (!items.length) continue;
-    const bounds = boundsOf(items.map(item => [item.a, item.b]));
-    const axis = bounds.right - bounds.left >= bounds.top - bounds.bottom ? 'x' : 'y';
-    const low = axis === 'x' ? bounds.left : bounds.bottom;
-    const high = axis === 'x' ? bounds.right : bounds.top;
-    const size = Math.max(2 * SIMILAR_PATH_DISTANCE, (high - low) / 32);
-    const bucket = value => Math.floor((value - low) / size);
-    const bins = new Map();
-    for (const item of items) {
-      const padding = SIMILAR_PATH_DISTANCE * 2;
-      const from = bucket(Math.min(item.a[axis], item.b[axis]) - padding);
-      const to = bucket(Math.max(item.a[axis], item.b[axis]) + padding);
-      for (let i = from; i <= to; i++) {
-        if (!bins.has(i)) bins.set(i, []);
-        bins.get(i).push(item);
-      }
-    }
-    nearbyByLayer.set(layer, p => bins.get(bucket(p[axis])) || []);
-  }
-  return { key: JSON.stringify(sections), length, samples, nearbyByLayer };
-}
-
-function shortestPerSimilarPath(sortedRoutes) {
-  if (sortedRoutes.length < 2) return sortedRoutes;
-  const seen = new Map();
-  const covers = (source, target, tolerance) => {
-    let missed = 0;
-    for (const { p, layer } of source.samples) {
-      const nearby = target.nearbyByLayer.get(layer)?.(p) || [];
-      let gap = Infinity;
-      for (const { a, b } of nearby) {
-        gap = Math.min(gap, distance(project(p, a, b).p, p));
-        if (gap <= tolerance) break;
-      }
-      if (gap > 2 * tolerance || (gap > tolerance && ++missed > Math.floor(source.samples.length * 0.05))) return false;
-    }
-    return true;
   };
-  return sortedRoutes.filter(route => {
-    const shape = describeRouteShape(route);
-    if (!shape.length) return true;
-    if (!seen.has(shape.key)) seen.set(shape.key, []);
-    const candidates = seen.get(shape.key);
-    if (candidates.some(shorter => {
-      const tolerance = Math.min(SIMILAR_PATH_DISTANCE, shorter.length * 0.02, shape.length * 0.02);
-      return covers(shape, shorter, tolerance) && covers(shorter, shape, tolerance);
-    })) return false;
-    candidates.push(shape);
-    return true;
-  });
+  yield { stage: '搜索连通路径', detail: '已保留 0 类' };
+  const { routes, limited, collapsedBranches, mergedRoutes } =
+    yield* enumerateRoutes(graph, ids[0], ids[1], finish, materialize, suppressed, board, inside, meshPlanes, trace);
+  yield '按长度排列 ' + routes.length + ' 条路径';
+  routes.sort((a, b) => a.length - b.length);
+  if (refinementBudget.exhausted) warnings.add('部分复杂铜区候选达到倒角优化上限，保留已验证的路径。');
+  if (mergeLimited) warnings.add('达到过孔合并预算，其余过孔仍按独立位置参与搜索。');
+  trace('solver.result', { routes: routes.length, shortestMil: routes[0]?.length, longestMil: routes.at(-1)?.length,
+    incomplete, limited, meshCachePoints: meshCache.points, warningCount: warnings.size });
+  for (const [i, route] of routes.slice(0, 6).entries()) {
+    const changes = route.edges.filter(edge => edge.kind === 'via');
+    trace('solver.route-sample', { route: i + 1, lengthMil: route.length, edges: route.edges.length,
+      viaCount: changes.length, changes: changes.slice(0, 8).map(edge => ({ p: edge.path[0], layers: edge.layers })) });
+  }
+  return { routes, incomplete, limited, mergedVias, collapsedBranches, mergedRoutes, warnings: [...warnings] };
 }
