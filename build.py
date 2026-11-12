@@ -37,9 +37,13 @@ def verify_package(path):
         if archive.testzip() is not None:
             raise ValueError("扩展包完整性校验失败。")
         manifest = json.loads(archive.read("extension.json"))
-        for name in ("name", "uuid", "displayName", "description", "version", "license", "repository", "categories"):
+        for name in ("name", "uuid", "displayName", "description", "version", "license", "repository", "categories", "keywords"):
             if not manifest.get(name):
                 raise ValueError(f"扩展清单缺少必填属性：{name}")
+        if not isinstance(manifest["keywords"], list) or not all(
+            isinstance(keyword, str) and keyword.strip() for keyword in manifest["keywords"]
+        ):
+            raise ValueError("扩展关键词 keywords 必须为非空字符串数组。")
         entry = manifest["entry"].removeprefix("./")
         if not entry.endswith(".js"):
             entry += ".js"

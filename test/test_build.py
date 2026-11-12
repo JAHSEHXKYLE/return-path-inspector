@@ -72,18 +72,27 @@ class PackageTests(unittest.TestCase):
                     with self.assertRaises(KeyError):
                         build.verify_package(damaged)
 
-    def test_verifier_rejects_missing_license_metadata_and_stale_changelog(self):
+    def test_verifier_rejects_invalid_marketplace_metadata_and_stale_changelog(self):
         with tempfile.TemporaryDirectory(dir=TEST_WORK) as directory:
             package = build.build(Path(directory))
             damaged = Path(directory) / "damaged.eext"
-            for mutation in ("license", "changelog"):
+            for mutation in ("license", "keywords_missing", "keywords_empty", "keywords_string",
+                             "keywords_blank", "keywords_number", "changelog"):
                 with self.subTest(mutation=mutation):
                     with ZipFile(package) as source, ZipFile(damaged, "w") as target:
                         for name in source.namelist():
                             data = source.read(name)
-                            if mutation == "license" and name == "extension.json":
+                            if name == "extension.json" and mutation != "changelog":
                                 manifest = json.loads(data)
-                                manifest.pop("license")
+                                if mutation == "license":
+                                    manifest.pop("license")
+                                elif mutation == "keywords_missing":
+                                    manifest.pop("keywords")
+                                else:
+                                    manifest["keywords"] = {
+                                        "keywords_empty": [], "keywords_string": "PCB",
+                                        "keywords_blank": ["PCB", "  "], "keywords_number": ["PCB", 42],
+                                    }[mutation]
                                 data = json.dumps(manifest).encode()
                             if mutation == "changelog" and name == "CHANGELOG.md":
                                 data = b"# Changelog\n\n## v0.0.0\nOld entry\n"
