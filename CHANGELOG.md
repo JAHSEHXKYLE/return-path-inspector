@@ -1,5 +1,12 @@
 # 版本记录
 
+## v1.0.3
+
+- 按作者选择，将本版本许可证调整为常规开源许可 Apache-2.0，允许遵守协议的商业使用、修改和分发。
+- 同步更新 extension.json、完整 LICENSE、项目版权 NOTICE、README 和中文许可证说明，移除当前版本的非商业使用限制。
+- 保留 keywords、原扩展 UUID、Logo、横幅、使用说明及操作截图；求解算法与界面功能不变。
+- 重新提供 EEXT、ZIP 安装包及 SHA-256 校验文件，供手动提交扩展广场审核。
+
 ## v1.0.2
 
 - 根据嘉立创客服反馈，在 extension.json 中补充 keywords 关键词数组，包含 PCB、GND、回流路径、路径分析、铺铜、过孔、多层板和 return-path。

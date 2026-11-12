@@ -4,9 +4,9 @@
 
 嘉立创 EDA 专业版 PCB 扩展。选择起始点和流入点，查看同一网络铜箔中的不同可行路线、换层位置和几何长度。
 
-**当前版本 v1.0.2 正式版** · Windows · 嘉立创 EDA 专业版 V4.1
+**当前版本 v1.0.3 正式版** · Windows · 嘉立创 EDA 专业版 V4.1
 
-**源码可用 · 非商业许可**：采用 [PolyForm Noncommercial 1.0.0](LICENSE)。允许协议规定的非商业用途；商业使用需取得单独授权。详见 [中文许可证说明](docs/licensing.md)。
+**Apache-2.0 开源许可**：允许遵守协议的商业使用、修改和分发，分发时须保留许可证及相关版权声明。详见 [中文许可证说明](docs/licensing.md)。
 
 [下载扩展](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) · [版本记录](CHANGELOG.md) · [1.0 发布与验证记录](docs/release-1.0.md) · [详细判定范围](docs/guide.md#判定与范围)
 
@@ -14,7 +14,7 @@
 
 ## 安装与第一次检查
 
-1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v1.0.2.eext`。
+1. 在 [Releases](https://github.com/JAHSEHXKYLE/return-path-inspector/releases) 下载 `return-path-inspector_v1.0.3.eext`。
 2. 在嘉立创 EDA 中打开目标 PCB，通过 **高级 → 扩展管理器 → 导入** 选择扩展包，并在已安装列表中启用。扩展包内置项目 PNG Logo，已安装列表会使用该图标。
 3. 确认 PCB 已生成最新覆铜。打开 **回流路径 → 单对点检查**，按顶部提示先点击起始点，再点击流入点。部分客户端将扩展入口放在「高级」菜单下。
 4. 两点采集完成后自动计算，列表按长度排列不同的可行解。默认选中第一条，工作区同步显示这条路线。
@@ -23,12 +23,12 @@
 
 ### 从测试版升级
 
-1. 在扩展管理器中导入 v1.0.2 包，按客户端提示更新同名扩展。
+1. 在扩展管理器中导入 v1.0.3 包，按客户端提示更新同名扩展。
 2. 检查已安装版本及项目图标，重新打开一次「回流路径」窗口。
 3. 当前 PCB 的颜色、线宽、板厚和铜层深度沿用原配置。需要更新路线结果时，点击「计算 / 重新计算」。
 4. 测试版登记的预览线可通过「清除已生成路径」清理。备份文件、工程权限及 PCB 的保存操作按项目原有流程处理。
 
-Releases 同时提供安装包的 SHA-256 文件。Windows PowerShell 中可用 `Get-FileHash .\return-path-inspector_v1.0.2.eext -Algorithm SHA256` 核对下载内容。
+Releases 同时提供安装包的 SHA-256 文件。Windows PowerShell 中可用 `Get-FileHash .\return-path-inspector_v1.0.3.eext -Algorithm SHA256` 核对下载内容。
 
 ## 查看路线
 
@@ -144,10 +144,10 @@ cd return-path-inspector
 node --test test/popup.test.cjs test/return-path.test.cjs
 python -m unittest discover -s test -p "test_*.py" -v
 python build.py
-python build.py --verify build/dist/return-path-inspector_v1.0.2.eext
+python build.py --verify build/dist/return-path-inspector_v1.0.3.eext
 ```
 
-构建结果位于 `build/dist/return-path-inspector_v1.0.2.eext`，同目录生成 `.eext.sha256`。相同源码和构建环境的重复构建会生成相同安装包。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包及校验文件会发布到 Releases，发布说明使用对应版本的中文更新记录。
+构建结果位于 `build/dist/return-path-inspector_v1.0.3.eext`，同目录生成 `.eext.sha256`。相同源码和构建环境的重复构建会生成相同安装包。GitHub Actions 在 Windows 环境中测试和打包。推送与 `extension.json` 版本一致的 `v` 标签后，构建通过的扩展包及校验文件会发布到 Releases，发布说明使用对应版本的中文更新记录。
 
 | 路径 | 内容 |
 | --- | --- |
